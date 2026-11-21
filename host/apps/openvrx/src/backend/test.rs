@@ -82,6 +82,10 @@ pub fn run(ctx: BackendContext) {
                 "recording needs the live backend: test patterns have no raw I/Q",
             ),
             AppCommand::StopRecording => {}
+            AppCommand::StartVideoRecording { .. } => {
+                ctx.message(MessageLevel::Warning, "video recording needs a live view (vrx)")
+            }
+            AppCommand::StopVideoRecording => {}
         }
     }
 }

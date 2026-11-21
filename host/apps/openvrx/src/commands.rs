@@ -27,6 +27,9 @@ pub enum AppCommand {
     SetVideo(VideoSettings),
     StartRecording { folder: PathBuf },
     StopRecording,
+    /// Decoded picture of view 0 to an MP4 in `folder` (needs ffmpeg).
+    StartVideoRecording { folder: PathBuf },
+    StopVideoRecording,
     Shutdown,
 }
 
@@ -80,6 +83,17 @@ pub struct RecordingStatus {
     /// Host time recording started (clock::now_ns).
     pub started_ns: u64,
     pub bytes: u64,
+    pub path: Option<PathBuf>,
+    /// Decoded-picture (MP4) recording, independent of the raw one.
+    pub video: VideoRecordingStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VideoRecordingStatus {
+    pub active: bool,
+    pub started_ns: u64,
+    /// Fields encoded so far.
+    pub frames: u64,
     pub path: Option<PathBuf>,
 }
 

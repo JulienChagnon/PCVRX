@@ -450,6 +450,40 @@ impl VideoPreset {
     pub fn next(self) -> Self {
         cycle(&Self::ALL, self)
     }
+
+    pub fn prev(self) -> Self {
+        let k = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(k + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Position in `ALL` (the order the arrow keys step through).
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&p| p == self).unwrap_or(0)
+    }
+
+    /// Name shown in the menu and the switch overlay.
+    pub fn title(self) -> &'static str {
+        match self {
+            VideoPreset::Raw => "Raw",
+            VideoPreset::LowLatency => "Low latency",
+            VideoPreset::Balanced => "Balanced",
+            VideoPreset::Quality => "Quality",
+            VideoPreset::Learned => "Learned",
+            VideoPreset::Plugin => "Plugin",
+        }
+    }
+
+    /// One line on what the preset does to the picture.
+    pub fn description(self) -> &'static str {
+        match self {
+            VideoPreset::Raw => "The demodulated picture, nothing added: what the signal really looks like.",
+            VideoPreset::LowLatency => "2D comb, line repair and edge-directed deinterlace. No temporal filter, no added delay.",
+            VideoPreset::Balanced => "Low latency plus a light denoise that only acts where the picture is still.",
+            VideoPreset::Quality => "3D comb and motion-compensated denoise from past fields: the cleanest built-in pipeline.",
+            VideoPreset::Learned => "Raw plus a fitted linear filter on the GPU. Light, any GPU, no added delay.",
+            VideoPreset::Plugin => "Raw plus the filter plugin you load (video.plugin_path). Its cost depends on the plugin.",
+        }
+    }
 }
 
 /// Video standard selection.

@@ -14,6 +14,7 @@ mod menu;
 mod osd;
 mod panels;
 mod present;
+mod preset_switch;
 mod settings;
 mod source;
 mod stats;

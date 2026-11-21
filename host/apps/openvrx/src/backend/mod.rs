@@ -8,6 +8,7 @@
 
 pub mod live;
 pub mod test;
+pub mod video_rec;
 
 use crate::commands::{AppCommand, BackendEvent, BackendStatus, MessageLevel};
 use crate::source::{StatusCell, Waker};

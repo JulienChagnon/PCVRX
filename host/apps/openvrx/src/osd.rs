@@ -5,7 +5,7 @@
 //! Safety rule: while any picture cleanup is active the per-receiver C/N
 //! bars are drawn even when the OSD is switched off.
 
-use crate::commands::{BackendStatus, RecordingStatus};
+use crate::commands::{BackendStatus, RecordingStatus, VideoRecordingStatus};
 use crate::gpu::{palette_index, PALETTE};
 use crate::source::{LockState, SourceStatus};
 use crate::stats::Summary;
@@ -100,6 +100,12 @@ pub fn fmt_rec(r: &RecordingStatus, now_ns: u64) -> Option<String> {
             fmt_bytes(r.bytes)
         )
     })
+}
+
+/// "VID 00:12" while the decoded picture is being recorded.
+pub fn fmt_video_rec(v: &VideoRecordingStatus, now_ns: u64) -> Option<String> {
+    v.active
+        .then(|| format!("VID {}", fmt_elapsed(now_ns.saturating_sub(v.started_ns))))
 }
 
 fn palette_color(rx: u8) -> Color32 {
@@ -258,6 +264,11 @@ pub fn paint_global(
     let mut x = inner.right();
     if let Some(rec) = fmt_rec(&backend.recording, now_ns) {
         let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, &rec, text, Color32::WHITE);
+        p.circle_filled(Pos2::new(r.left() - 10.0, r.center().y), 6.0 * scale, Color32::RED);
+        x = r.left() - 22.0;
+    }
+    if let Some(vid) = fmt_video_rec(&backend.recording.video, now_ns) {
+        let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, &vid, text, Color32::WHITE);
         p.circle_filled(Pos2::new(r.left() - 10.0, r.center().y), 6.0 * scale, Color32::RED);
         x = r.left() - 22.0;
     }

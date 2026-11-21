@@ -77,6 +77,8 @@ pub struct OpenvrxApp {
     show_help: bool,
     /// The Esc menu (actions with their keys, band and channel).
     menu: Menu,
+    /// The strip shown when the preset changes (arrow keys, menu).
+    preset_switch: crate::preset_switch::PresetSwitch,
     surface_applied: Option<(wgpu::PresentMode, u32)>,
     supported_modes: Vec<wgpu::PresentMode>,
     fullscreen_applied: Option<bool>,
@@ -146,6 +148,7 @@ impl OpenvrxApp {
             show_panels: false,
             show_help: false,
             menu: Menu::new(),
+            preset_switch: Default::default(),
             surface_applied: None,
             supported_modes,
             fullscreen_applied: None,
@@ -217,7 +220,8 @@ impl OpenvrxApp {
     }
 
     /// Reads bench commands from stdin, one per line (`record FOLDER`,
-    /// `stop`, `compare`, `quit`), and echoes every backend message to
+    /// `stop`, `video FOLDER` and `vstop` for the MP4 of view 1, `compare`,
+    /// `quit`), and echoes every backend message to
     /// stdout as `MSG ...` so a script can follow (tools/bench/bench.py --live).
     pub fn start_bench_control(&mut self, ctx: egui::Context) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -252,6 +256,14 @@ impl OpenvrxApp {
                     self.backend.send(AppCommand::StopRecording);
                     bench_out("OK stop");
                 }
+                "video" if !arg.is_empty() => {
+                    self.backend.send(AppCommand::StartVideoRecording { folder: arg.into() });
+                    bench_out(&format!("OK video {arg}"));
+                }
+                "vstop" => {
+                    self.backend.send(AppCommand::StopVideoRecording);
+                    bench_out("OK vstop");
+                }
                 "compare" => {
                     self.toggle_compare();
                     bench_out("OK compare");
@@ -285,6 +297,28 @@ impl OpenvrxApp {
 
     pub fn send(&self, cmd: AppCommand) {
         self.backend.send(cmd);
+    }
+
+    /// Selects a video preset and starts the switch overlay; `steps` gives
+    /// the direction it slides from (arrow keys: +-1; menu: the index jump).
+    pub fn set_preset(&mut self, p: crate::settings::VideoPreset, steps: i32) {
+        if steps == 0 || p == self.settings.video.preset {
+            return;
+        }
+        self.settings.video.preset = p;
+        self.preset_switch.start(steps, now_ns());
+    }
+
+    /// What the switch overlay adds under the description, if anything.
+    fn preset_note(&self) -> Option<&'static str> {
+        let v = &self.settings.video;
+        if !v.cleanup {
+            Some("cleanup is off (Space): the raw picture shows until it is on")
+        } else if v.preset == crate::settings::VideoPreset::Plugin && v.plugin_path.is_none() {
+            Some("no plugin set (video.plugin_path, or --plugin): the raw pipeline shows")
+        } else {
+            None
+        }
     }
 
     pub fn note(&mut self, text: impl Into<String>) {
@@ -415,18 +449,15 @@ impl OpenvrxApp {
             Action::Panels => self.show_panels = !self.show_panels,
             Action::Osd => d.osd = !d.osd,
             Action::Record => self.toggle_recording(),
+            Action::RecordVideo => self.toggle_video_recording(),
             Action::Cleanup => self.settings.video.cleanup = !self.settings.video.cleanup,
             Action::Preset => {
-                let v = &mut self.settings.video;
-                v.preset = v.preset.next();
-                let text = match (v.cleanup, v.preset) {
-                    (false, p) => format!("preset {} (cleanup is off: Space)", p.name()),
-                    (true, crate::settings::VideoPreset::Plugin) if v.plugin_path.is_none() => {
-                        "preset plugin: no plugin set (video.plugin_path, or --plugin)".to_string()
-                    }
-                    (true, p) => format!("preset {}", p.name()),
-                };
-                self.note(text);
+                let p = self.settings.video.preset.next();
+                self.set_preset(p, 1);
+            }
+            Action::PresetPrev => {
+                let p = self.settings.video.preset.prev();
+                self.set_preset(p, -1);
             }
             Action::SteadyOsd => self.settings.video.steady_osd = !self.settings.video.steady_osd,
             Action::Hd3 => d.hd3_mode = !d.hd3_mode,
@@ -520,6 +551,7 @@ impl OpenvrxApp {
         let d = self.settings.display.clone();
         let v = self.settings.video.clone();
         let recording = self.backend_status.recording.active;
+        let video_recording = self.backend_status.recording.video.active;
         let state = move |a: Action| match a {
             Action::Fullscreen => RowState::On(d.fullscreen),
             Action::Osd => RowState::On(d.osd),
@@ -529,6 +561,7 @@ impl OpenvrxApp {
             Action::Preset => RowState::Value(v.preset.name().to_string()),
             Action::SteadyOsd => RowState::On(v.steady_osd),
             Action::Record => RowState::On(recording),
+            Action::RecordVideo => RowState::On(video_recording),
             Action::Layout => RowState::Value(d.layout.name().to_string()),
             Action::Aspect => RowState::Value(d.aspect.name().to_string()),
             Action::Scaling => RowState::Value(d.scaling.name().to_string()),
@@ -537,10 +570,12 @@ impl OpenvrxApp {
             _ => RowState::None,
         };
         let mhz = self.current_mhz();
-        for pick in self.menu.show(ctx, mhz, state) {
+        let preset = self.settings.video.preset;
+        for pick in self.menu.show(ctx, mhz, preset, state) {
             match pick {
                 MenuPick::Act(a) => self.act(ctx, a),
                 MenuPick::Tune(f) => self.tune(f),
+                MenuPick::Preset(p) => self.set_preset(p, p.index() as i32 - preset.index() as i32),
             }
         }
     }
@@ -550,6 +585,16 @@ impl OpenvrxApp {
             self.backend.send(AppCommand::StopRecording);
         } else {
             self.backend.send(AppCommand::StartRecording {
+                folder: self.settings.recording.folder.clone(),
+            });
+        }
+    }
+
+    pub fn toggle_video_recording(&mut self) {
+        if self.backend_status.recording.video.active {
+            self.backend.send(AppCommand::StopVideoRecording);
+        } else {
+            self.backend.send(AppCommand::StartVideoRecording {
                 folder: self.settings.recording.folder.clone(),
             });
         }
@@ -753,6 +798,8 @@ impl eframe::App for OpenvrxApp {
             self.help_window(&ctx);
         }
         self.menu_ui(&ctx);
+        let (preset, note) = (self.settings.video.preset, self.preset_note());
+        self.preset_switch.draw(&ctx, preset, note, now_ns());
         self.apply_settings(&ctx, frame);
 
         // Line-to-submit latency: the frame built here is submitted and

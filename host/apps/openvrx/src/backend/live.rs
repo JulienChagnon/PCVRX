@@ -19,7 +19,8 @@
 //! and a missing board is reported instead of blocking.
 
 use super::BackendContext;
-use crate::commands::{AppCommand, BackendEvent, MessageLevel, RecordingStatus};
+use super::video_rec::{video_path, VideoRecorder, VideoTap};
+use crate::commands::{AppCommand, BackendEvent, MessageLevel, RecordingStatus, VideoRecordingStatus};
 use crate::settings::{
     ControlMode, DiversityMode, GainMode, ReceiverSettings, VideoSettings, ViewSource, DEFAULT_GAIN,
 };
@@ -102,7 +103,9 @@ pub fn dsp_config(r: &ReceiverSettings, standard: Option<VideoStandard>) -> RxDs
     }
 }
 
-/// Video pipeline configuration for the app's video settings.
+/// Video pipeline configuration for the app's video settings (no plugin;
+/// the app itself goes through `video_config_with`).
+#[cfg(test)]
 pub fn video_config(v: &VideoSettings, standard: VideoStandard) -> VideoConfig {
     video_config_with(v, standard, None)
 }
@@ -591,6 +594,7 @@ fn video_loop(
     mut producer: FrameProducer,
     stop: Arc<AtomicBool>,
     health: Arc<VideoHealth>,
+    video_tap: Arc<VideoTap>,
 ) {
     let mut current = settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut pipe: Option<(VideoStandard, VideoPipeline)> = None;
@@ -687,9 +691,9 @@ fn video_loop(
                         vp.filter.mark_break();
                     }
                     let steady = p.config().deinterlace == DeinterlaceMethod::LineDouble;
-                    let shown = vp.filter.field(f, steady);
+                    let shown = vp.filter.field(f, steady).unwrap_or(f);
                     producer.publish(
-                        shown.unwrap_or(f),
+                        shown,
                         RowUpdate {
                             rows: 0..f.height,
                             lines: std::mem::take(&mut held_lines),
@@ -698,6 +702,7 @@ fn video_loop(
                             newest_line_ns: stamp,
                         },
                     );
+                    video_tap.offer(shown);
                 }
             }
             _ => {
@@ -712,6 +717,9 @@ fn video_loop(
                         newest_line_ns: stamp,
                     },
                 );
+                if field_done {
+                    video_tap.offer(f);
+                }
             }
         }
         if !field_done {
@@ -741,6 +749,8 @@ struct LiveView {
     rxs: Vec<RxId>,
     status: Arc<StatusCell<SourceStatus>>,
     health: Arc<VideoHealth>,
+    /// Finished fields for the MP4 recorder (used on view 0).
+    video_tap: Arc<VideoTap>,
 }
 
 // ---------------------------------------------------------------------
@@ -1073,6 +1083,7 @@ struct State {
     live: Option<Live>,
     views: Vec<Option<LiveView>>,
     recorder: Option<Recorder>,
+    video_rec: Option<VideoRecorder>,
     hw_error: Option<String>,
 }
 
@@ -1089,6 +1100,7 @@ pub fn run(ctx: BackendContext) {
         live: None,
         views: (0..crate::settings::VIEW_SLOTS).map(|_| None).collect(),
         recorder: None,
+        video_rec: None,
         hw_error: None,
     };
     let mut last_status = 0u64;
@@ -1106,6 +1118,7 @@ pub fn run(ctx: BackendContext) {
         }
     }
     stop_recording(&ctx, &mut st);
+    stop_video_recording(&ctx, &mut st);
     // Views and receivers stop when dropped (DSP threads join, streams
     // stop).
     st.views.clear();
@@ -1172,6 +1185,56 @@ fn handle(ctx: &BackendContext, st: &mut State, cmd: AppCommand) {
         }
         AppCommand::StartRecording { folder } => start_recording(ctx, st, &folder),
         AppCommand::StopRecording => stop_recording(ctx, st),
+        AppCommand::StartVideoRecording { folder } => start_video_recording(ctx, st, &folder),
+        AppCommand::StopVideoRecording => stop_video_recording(ctx, st),
+    }
+}
+
+/// Starts the MP4 recording of view 0's decoded picture.
+fn start_video_recording(ctx: &BackendContext, st: &mut State, folder: &Path) {
+    if st.video_rec.is_some() {
+        return;
+    }
+    let Some(view) = st.views.first().and_then(|v| v.as_ref()) else {
+        ctx.message(MessageLevel::Warning, "video recording: no live picture in view 1 yet");
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(folder) {
+        ctx.message(MessageLevel::Error, format!("{}: {e}", folder.display()));
+        return;
+    }
+    let path = video_path(&recording_base(folder, &openvrx_format::utc_now_string()));
+    match VideoRecorder::start(Arc::clone(&view.video_tap), path, now_ns()) {
+        Ok(v) => {
+            ctx.message(MessageLevel::Info, format!("video recording to {}", v.path.display()));
+            st.video_rec = Some(v);
+        }
+        Err(e) => ctx.message(MessageLevel::Error, e),
+    }
+}
+
+fn stop_video_recording(ctx: &BackendContext, st: &mut State) {
+    let Some(v) = st.video_rec.take() else {
+        return;
+    };
+    match v.stop() {
+        Ok(s) => {
+            let note = if s.dropped > 0 {
+                format!(", {} fields dropped: encoder too slow", s.dropped)
+            } else {
+                String::new()
+            };
+            ctx.message(
+                MessageLevel::Info,
+                format!(
+                    "video saved: {} ({} fields, {:.1} MB{note})",
+                    s.path.display(),
+                    s.frames,
+                    s.bytes as f64 / 1e6
+                ),
+            );
+        }
+        Err(e) => ctx.message(MessageLevel::Error, format!("video recording: {e}")),
     }
 }
 
@@ -1214,14 +1277,16 @@ fn open_view(ctx: &BackendContext, st: &mut State, view: usize, source: ViewSour
     let (tx, rx) = crossbeam_channel::bounded(LINE_QUEUE);
     let stop = Arc::new(AtomicBool::new(false));
     let health = Arc::new(VideoHealth::default());
+    let video_tap = Arc::new(VideoTap::default());
     let thread = {
         let producer = exchange.producer();
         let settings = Arc::clone(&st.video);
         let stop = Arc::clone(&stop);
         let health = Arc::clone(&health);
+        let tap = Arc::clone(&video_tap);
         std::thread::Builder::new()
             .name(format!("openvrx-video-{view}"))
-            .spawn(move || video_loop(rx, settings, producer, stop, health))
+            .spawn(move || video_loop(rx, settings, producer, stop, health, tap))
     };
     let thread = match thread {
         Ok(t) => t,
@@ -1252,6 +1317,7 @@ fn open_view(ctx: &BackendContext, st: &mut State, view: usize, source: ViewSour
             rxs: use_rx,
             status,
             health,
+            video_tap,
         });
     }
     ctx.emit(BackendEvent::ViewOpened {
@@ -1569,6 +1635,20 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
             s.simulated = false;
         });
     }
+    // An encoder that stopped on its own (ffmpeg error, size change) is
+    // closed here so its message reaches the app.
+    if st.video_rec.as_ref().is_some_and(|v| !v.running()) {
+        stop_video_recording(ctx, st);
+    }
+    let video = match &st.video_rec {
+        Some(v) => VideoRecordingStatus {
+            active: true,
+            started_ns: v.started_ns,
+            frames: v.frames.load(Ordering::Relaxed),
+            path: Some(v.path.clone()),
+        },
+        None => VideoRecordingStatus::default(),
+    };
     let recording = match &st.recorder {
         Some(r) => RecordingStatus {
             available: true,
@@ -1576,9 +1656,11 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
             started_ns: r.started_ns,
             bytes: r.bytes.load(Ordering::Relaxed),
             path: Some(r.path.clone()),
+            video,
         },
         None => RecordingStatus {
             available: true,
+            video,
             ..RecordingStatus::default()
         },
     };
@@ -1759,7 +1841,7 @@ mod tests {
         let health = Arc::new(VideoHealth::default());
         let thread = {
             let (producer, stop, health) = (ex.producer(), Arc::clone(&stop), Arc::clone(&health));
-            std::thread::spawn(move || video_loop(rx, settings, producer, stop, health))
+            std::thread::spawn(move || video_loop(rx, settings, producer, stop, health, Arc::default()))
         };
         let mut st = UploadStaging::default();
         let mut probes = Vec::new();

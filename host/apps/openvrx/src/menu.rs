@@ -4,6 +4,7 @@
 
 use crate::channels::{self, BANDS};
 use crate::keys::{key_name, Action, BINDINGS};
+use crate::settings::VideoPreset;
 use egui::{Color32, CornerRadius, RichText, Stroke, Vec2};
 use std::sync::mpsc;
 
@@ -25,7 +26,6 @@ const GROUPS: &[(&str, &[Action])] = &[
         "Picture",
         &[
             Action::Cleanup,
-            Action::Preset,
             Action::SteadyOsd,
             Action::Damage,
             Action::Compare,
@@ -35,7 +35,14 @@ const GROUPS: &[(&str, &[Action])] = &[
     ),
     (
         "Receiver",
-        &[Action::Record, Action::Calibrate, Action::ChannelDown, Action::ChannelUp, Action::ResetStats],
+        &[
+            Action::Record,
+            Action::RecordVideo,
+            Action::Calibrate,
+            Action::ChannelDown,
+            Action::ChannelUp,
+            Action::ResetStats,
+        ],
     ),
     ("App", &[Action::Panels, Action::Help, Action::Quit]),
 ];
@@ -48,8 +55,10 @@ fn label(a: Action) -> &'static str {
         Action::Panels => "Control panels",
         Action::Osd => "OSD",
         Action::Record => "Record raw",
+        Action::RecordVideo => "Record video (MP4)",
         Action::Cleanup => "Cleanup",
-        Action::Preset => "Video preset",
+        Action::Preset => "Next video preset",
+        Action::PresetPrev => "Previous video preset",
         Action::SteadyOsd => "Steady OSD",
         Action::Hd3 => "HD3 goggle mode",
         Action::Layout => "Views 1 / 2 / 4",
@@ -84,6 +93,7 @@ pub enum RowState {
 pub enum MenuPick {
     Act(Action),
     Tune(u32),
+    Preset(VideoPreset),
 }
 
 pub struct Menu {
@@ -141,7 +151,13 @@ impl Menu {
     }
 
     /// Draws the menu; returns what was clicked.
-    pub fn show(&mut self, ctx: &egui::Context, mhz: u32, state: impl Fn(Action) -> RowState) -> Vec<MenuPick> {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        mhz: u32,
+        preset: VideoPreset,
+        state: impl Fn(Action) -> RowState,
+    ) -> Vec<MenuPick> {
         let mut picks = Vec::new();
         if !self.open {
             return picks;
@@ -167,6 +183,8 @@ impl Menu {
                     self.header(ui, mhz);
                     ui.add_space(14.0);
                     self.channel_picker(ui, mhz, &mut picks);
+                    ui.add_space(16.0);
+                    preset_picker(ui, preset, &mut picks);
                     ui.add_space(16.0);
                     egui::ScrollArea::vertical()
                         .max_height((ctx.content_rect().height() - 330.0).max(160.0))
@@ -250,6 +268,31 @@ fn tune_on_console(mhz: u32) -> Result<u32, String> {
     let (got, _) = c5.tune(mhz, 0).map_err(|e| format!("tune: {e}"))?;
     c5.save().map_err(|e| format!("save: {e}"))?;
     Ok(got)
+}
+
+/// The video presets as pills in arrow-key order, with the description of
+/// the one under the pointer (or the current one) below them.
+fn preset_picker(ui: &mut egui::Ui, current: VideoPreset, picks: &mut Vec<MenuPick>) {
+    ui.horizontal(|ui| {
+        section(ui, "Picture mode");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new("\u{2190} \u{2192}").monospace().color(DIM));
+        });
+    });
+    let mut shown = current;
+    ui.horizontal_wrapped(|ui| {
+        for p in VideoPreset::ALL {
+            let r = ui.add(pill(RichText::new(p.title()).size(13.0), p == current).min_size(Vec2::new(0.0, 28.0)));
+            if r.hovered() {
+                shown = p;
+            }
+            if r.clicked() && p != current {
+                picks.push(MenuPick::Preset(p));
+            }
+        }
+    });
+    ui.add_space(2.0);
+    ui.label(RichText::new(shown.description()).size(12.5).color(if shown == current { TEXT } else { DIM }));
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
