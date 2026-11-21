@@ -149,14 +149,16 @@ fn main() {
         while t0.elapsed() < Duration::from_secs(60) {
             if let Ok(p) = ctl.vendor_in(GET_PINS, 0, 0, 16) {
                 let (a_or, a_and, b_or, b_and, r_or, r_and) = (p[0], p[1], p[2], p[3], p[6], p[7]);
+                let (d_or, d_and) = (p[4], p[5]);
                 let short = |or: u8, and: u8, bit: u8| match level(or, and, bit) {
                     "high" => "H",
                     "low" => "L",
                     _ => "~",
                 };
                 let pb: String = (0..8).rev().map(|b| short(b_or, b_and, b)).collect();
+                let pd: String = (0..8).rev().map(|b| short(d_or, d_and, b)).collect();
                 println!(
-                    "{:5.1}s  RDY1 {} (L)  PA4 {} (L)  PA5 {} (L)  RDY0 {} (H)  PA2 {} (H)  PA6 {} (H)  PB7..0 {}  (~ = toggling)",
+                    "{:5.1}s  RDY1 {} (L)  PA4 {} (L)  PA5 {} (L)  RDY0 {} (H)  PA2 {} (H)  PA6 {} (H)  PB7..0 {}  PD7..0 {}  (~ = toggling)",
                     t0.elapsed().as_secs_f64(),
                     short(r_or, r_and, 1),
                     short(a_or, a_and, 4),
@@ -164,7 +166,8 @@ fn main() {
                     short(r_or, r_and, 0),
                     short(a_or, a_and, 2),
                     short(a_or, a_and, 6),
-                    pb
+                    pb,
+                    pd
                 );
             }
             std::thread::sleep(Duration::from_millis(500));

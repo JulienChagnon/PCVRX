@@ -50,7 +50,9 @@
 //!                                             one CSV row per line from the DSP: input sample
 //!                                             position, field and line, quality (C/N, noise on the
 //!                                             porch and tip, clicks, power, weight, flags) and the
-//!                                             damaged and severe shares of its mask
+//!                                             damaged and severe shares of its mask; then the mean
+//!                                             IRE of the sync tip, back porch and picture (a porch
+//!                                             far from 0 = the tracked blanking level is off)
 //! ```
 //! REC is any file of a recording (`NAME.openvrx.json`, `NAME.rx0.bin`) or its base path.
 
@@ -692,8 +694,8 @@ fn jump_share(bytes: &[u8], fmt: &openvrx_core::LaneFormat) -> f64 {
 
 /// Sets the C5's sample clock edge to the cleanest of its three positions
 /// against the MODEM_DIAG bus, measured through the FX2 at the working rate.
-/// One stream: measure, `slip`, measure, `slip`, measure, then slip to the
-/// best. Uses the C5 console (`--c5 PORT`, default the first Espressif port)
+/// Measure, `slip`, measure, `slip`, measure, then slip to the best; the FX2
+/// stream is stopped during every slip. Uses the C5 console (`--c5 PORT`, default the first Espressif port)
 /// and pushes no other settings; `--lanes`/`--clk` must match the C5.
 fn phasecal(args: &[String]) -> Result<(), String> {
     use openvrx_hw::c5::{find_c5_ports, C5Client, ClientConfig, PortConnector};
@@ -737,12 +739,14 @@ fn phasecal(args: &[String]) -> Result<(), String> {
     let fmt = settings.sample_format().lanes.clone();
     let want = (seconds * settings.sample_format().sample_rate_hz()) as usize * fmt.word_bytes as usize;
     let cfg = ReceiverConfig::new(0, PortSelector::Name(String::new()), Fx2Selector::Only, settings.clone());
-    let receiver = Receiver::start_fx2_only(cfg).map_err(|e| format!("starting the FX2: {e}"))?;
 
-    // Bytes after the last slip: drop what is queued, then 50 ms more (the
-    // slip itself is a ~25 us clock gap), then collect `want` bytes.
-    let capture = |receiver: &Receiver| -> Result<Vec<u8>, String> {
-        while receiver.blocks().try_recv().is_ok() {}
+    // One stream per position, stopped before every slip: a slip briefly
+    // runs the sample clock far below the FX2's minimum external IFCLK rate
+    // (5 MHz in the datasheet), which a running slave FIFO does not survive
+    // cleanly. Stopped, the FX2 runs its interface on the internal clock. The first
+    // 50 ms of each stream are dropped (start-up), then `want` bytes kept.
+    let capture = || -> Result<Vec<u8>, String> {
+        let receiver = Receiver::start_fx2_only(cfg.clone()).map_err(|e| format!("starting the FX2: {e}"))?;
         let t0 = Instant::now();
         let mut buf = Vec::with_capacity(want);
         while buf.len() < want {
@@ -764,12 +768,11 @@ fn phasecal(args: &[String]) -> Result<(), String> {
     let mut shares = [f64::NAN; 3];
     let mut total = 0u32;
     for (k, share) in shares.iter_mut().enumerate() {
-        *share = jump_share(&capture(&receiver)?, &fmt);
+        *share = jump_share(&capture()?, &fmt);
         if k < 2 {
             total = c5.slip(1).map_err(|e| format!("slip: {e}"))?;
         }
     }
-    drop(receiver);
 
     // Positions relative to now (the third one): +1 slip is the first, +2 the second.
     let best = (0..3)
@@ -983,8 +986,37 @@ fn lines_csv(path: &str, args: &[String]) -> Result<(), String> {
     let mut r = rec.raw_reader(0).map_err(|e| e.to_string())?;
     let mut w = std::io::BufWriter::new(std::fs::File::create(out).map_err(|e| e.to_string())?);
     let io = |e: std::io::Error| e.to_string();
-    writeln!(w, "src_pos,field_seq,field_line,frame_line,flags,cn_db,noise_ire,clicks,power_db,weight,sync_score,damaged,severe")
-        .map_err(io)?;
+    writeln!(
+        w,
+        "src_pos,field_seq,field_line,frame_line,flags,cn_db,noise_ire,clicks,power_db,weight,sync_score,damaged,severe,\
+         tip_ire,porch_ire,picture_ire"
+    )
+    .map_err(io)?;
+    // Mean of a line's samples (IRE) between two times after 0H, in us:
+    // sync tip (-40 NTSC / -43 PAL when the levels are right), blanking
+    // from the end of sync to 0.3 us after the burst (0: the burst's whole
+    // cycles average out; some cameras start the picture before the
+    // standard's picture start),
+    // picture. A porch far from 0 means the tracked blanking level is off.
+    let window = |l: &LineRecord, t0_us: f64, t1_us: f64| -> f32 {
+        let par = l.standard.params();
+        let per_us = par.samples_per_line as f64 * par.line_hz / 1e6;
+        let (a, b) = ((t0_us * per_us) as usize, ((t1_us * per_us) as usize).min(l.samples.len()));
+        if a >= b {
+            return f32::NAN;
+        }
+        l.samples[a..b].iter().sum::<f32>() / (b - a) as f32
+    };
+    // --profile F1,F2,...: the mean waveform of each listed field's picture
+    // lines (VBI left out), written to OUT.profile.csv as t_us,F1,F2,...
+    let profile_fields: Vec<u64> = match opt(args, "--profile") {
+        Some(s) => s
+            .split(',')
+            .map(|x| x.trim().parse().map_err(|_| format!("--profile: bad field number `{x}`")))
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
+    let mut prof: BTreeMap<u64, (Vec<f64>, u32, f64)> = BTreeMap::new(); // sum, lines, samples per us
     let mut buf = vec![0u8; 1 << 18];
     let mut lines: Vec<LineRecord> = Vec::new();
     let mut count = 0u64;
@@ -996,13 +1028,23 @@ fn lines_csv(path: &str, args: &[String]) -> Result<(), String> {
         lines.clear();
         dsp.push_bytes(&buf[..n], 0, &mut lines);
         for l in &lines {
+            if profile_fields.contains(&l.field_seq) && !l.quality.flags.contains(openvrx_core::LineFlags::VBI) {
+                let par = l.standard.params();
+                let e = prof
+                    .entry(l.field_seq)
+                    .or_insert_with(|| (vec![0.0; l.samples.len()], 0, par.samples_per_line as f64 * par.line_hz / 1e6));
+                for (s, &x) in e.0.iter_mut().zip(&l.samples) {
+                    *s += x as f64;
+                }
+                e.1 += 1;
+            }
             let len = l.damage.len().max(1) as f32;
             let damaged = l.damage.iter().filter(|&&d| d != 0).count() as f32 / len;
             let severe = l.damage.iter().filter(|&&d| d >= openvrx_core::damage::SEVERE).count() as f32 / len;
             let q = &l.quality;
             writeln!(
                 w,
-                "{:.1},{},{},{},{},{:.2},{:.3},{},{:.2},{:.4},{:.3},{:.4},{:.4}",
+                "{:.1},{},{},{},{},{:.2},{:.3},{},{:.2},{:.4},{:.3},{:.4},{:.4},{:.1},{:.1},{:.1}",
                 l.src_position,
                 l.field_seq,
                 l.field_line,
@@ -1015,7 +1057,13 @@ fn lines_csv(path: &str, args: &[String]) -> Result<(), String> {
                 q.weight,
                 q.sync_score,
                 damaged,
-                severe
+                severe,
+                window(l, 1.0, 3.5),
+                {
+                    let p = l.standard.params();
+                    window(l, p.hsync_us + 0.4, p.burst_start_us + p.burst_cycles / p.fsc_hz * 1e6 + 0.3)
+                },
+                window(l, 12.0, 62.0)
             )
             .map_err(io)?;
             count += 1;
@@ -1023,6 +1071,25 @@ fn lines_csv(path: &str, args: &[String]) -> Result<(), String> {
     }
     w.flush().map_err(io)?;
     println!("{count} lines written to {out}");
+    if !prof.is_empty() {
+        let path = format!("{out}.profile.csv");
+        let mut p = std::io::BufWriter::new(std::fs::File::create(&path).map_err(io)?);
+        let keys: Vec<u64> = prof.keys().copied().collect();
+        writeln!(p, "t_us,{}", keys.iter().map(|k| format!("field{k}")).collect::<Vec<_>>().join(",")).map_err(io)?;
+        let (len, per_us) = prof.values().next().map(|v| (v.0.len(), v.2)).unwrap_or((0, 1.0));
+        for i in 0..len {
+            let row: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let (sum, n, _) = &prof[k];
+                    sum.get(i).map_or(String::new(), |s| format!("{:.2}", s / (*n).max(1) as f64))
+                })
+                .collect();
+            writeln!(p, "{:.3},{}", i as f64 / per_us, row.join(",")).map_err(io)?;
+        }
+        p.flush().map_err(io)?;
+        println!("profiles of fields {keys:?} written to {path}");
+    }
     Ok(())
 }
 
