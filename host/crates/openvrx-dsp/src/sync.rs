@@ -125,6 +125,8 @@ pub struct SyncReport {
     pub relocks: u64,
     pub coasted_lines: u64,
     pub lines_out: u64,
+    /// Times the levels had collapsed and a search re-measured them.
+    pub level_resets: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -167,6 +169,14 @@ pub struct Tbc {
     std: Option<VideoStandard>,
     ever_locked: bool,
     searching: bool,
+    /// Sync depth (blank - tip, Hz) measured at the last lock. The FM
+    /// deviation fixes it, so a tracked depth far from it means the level
+    /// trackers were pulled off by bad readings.
+    ref_depth: f64,
+    /// Levels collapsed: keep searching until a full lock re-measures them.
+    relevel: bool,
+    /// Lines in a row with a strong carrier but no pulse at all.
+    blind: u32,
     t: f64,
     p: f64,
     cov: [f64; 3],
@@ -330,6 +340,9 @@ impl Tbc {
             std: std_override,
             ever_locked: false,
             searching: true,
+            ref_depth: 0.0,
+            relevel: false,
+            blind: 0,
             t: 0.0,
             p: 0.0,
             cov: [0.0; 3],
@@ -805,10 +818,19 @@ impl Tbc {
         self.lv.tip = Scalar { x: tip, p: 1e8 };
         self.lv.blank = Scalar { x: blank, p: 1e8 };
         self.lv.valid = true;
+        self.ref_depth = blank - tip;
+        self.relevel = false;
         if self.lv.noise == 0.0 {
             self.lv.noise = 0.02 * (blank - tip);
         }
         let t = self.fine_edge(newest).map(|x| x.0).unwrap_or(newest);
+        // On a relock keep the flywheel's period: it was refined over many
+        // fine edges, while the train's comes from coarse slicer crossings
+        // over a few lines (a few tenths of a microsecond of edge spread
+        // make it wrong enough that the prediction walks out of the gate
+        // every few lines). A camera's line rate does not jump; the period
+        // loop still follows a slow change.
+        let period = if relock && self.std == Some(std) { self.p } else { period };
         if relock {
             // Jump the running flywheel to the new train: the next line
             // starts at the train's grid point after the current line start.
@@ -841,10 +863,47 @@ impl Tbc {
         self.relock_hist.clear();
     }
 
-    /// Blanking window after the burst, relative to 0H (input samples).
+    /// Blanking window after 0H (input samples): the breezeway, the burst
+    /// and 0.3 us after it. The burst's whole cycles average to the
+    /// blanking level, and the window ends before the picture of cameras
+    /// that start it earlier than the standard: a window running to the
+    /// standard picture start measures a dark left edge as blanking and
+    /// walks the level into the picture (whole fields go dark).
     fn blank_window(&self, p: &StandardParams) -> (f64, f64) {
-        let burst_end = p.burst_start_us + p.burst_cycles / p.fsc_hz * 1e6;
-        (self.us(burst_end + 0.3), self.us(p.active_start_us - 0.3))
+        (self.us(p.hsync_us + 0.4), self.us(Self::burst_end_us(p) + 0.3))
+    }
+
+    fn burst_end_us(p: &StandardParams) -> f64 {
+        p.burst_start_us + p.burst_cycles / p.fsc_hz * 1e6
+    }
+
+    /// Noise variance of the blanking window from its flat parts only (the
+    /// burst would count as noise), absolute line start `t0`.
+    fn blank_flat_var(&self, t0: f64, p: &StandardParams) -> Option<f64> {
+        let (a, _) = self.blank_window(p);
+        let before = self.mean_range(t0 + a, t0 + self.us(p.burst_start_us - 0.05));
+        let end = Self::burst_end_us(p);
+        let after = self.mean_range(t0 + self.us(end + 0.05), t0 + self.us(end + 0.3));
+        match (before, after) {
+            (Some(x), Some(y)) => Some((x.1 * x.2 as f64 + y.1 * y.2 as f64) / (x.2 + y.2) as f64),
+            (Some(x), None) | (None, Some(x)) => Some(x.1),
+            (None, None) => None,
+        }
+    }
+
+    /// True when the envelope over absolute [a, b) shows a carrier well
+    /// above the slicer's needs (`blind_cn_db`, not at the quantiser floor).
+    fn line_strong(&self, a: f64, b: f64) -> bool {
+        let base = self.base as f64;
+        let n = self.env.len();
+        let lo = ((a - base).max(0.0) as usize).min(n);
+        let hi = ((b - base).max(0.0) as usize).min(n);
+        if hi <= lo + 16 {
+            return false;
+        }
+        let mut acc = EnvAcc::default();
+        acc.add_slice(&self.env[lo..hi]);
+        acc.mean() > 0.0 && !acc.at_floor(self.step2) && acc.cn_db_q(self.step2) >= self.cfg.blind_cn_db
     }
 
     /// Mean and variance of v over absolute [a, b).
@@ -984,13 +1043,15 @@ impl Tbc {
         let mut measured = None;
         let mut innovation = f64::INFINITY;
         let mut outlier = false;
+        // Edge of a pulse found near the prediction but outside the gate.
+        let mut outlier_at = None;
         if let Some(pu) = found {
             if let Some((m, sig)) = self.fine_edge(pu.start) {
                 let r = sig * sig;
                 let s = pa + r;
                 let nu = m - pred;
                 self.innov_sd = s.sqrt();
-                let gate = (4.0 * s.sqrt()).max(self.us(0.08));
+                let gate = (4.0 * s.sqrt()).max(self.us(self.cfg.gate_min_us as f64));
                 if nu.abs() <= gate {
                     let k0 = pa / s;
                     let k1 = pb / s;
@@ -1001,6 +1062,7 @@ impl Tbc {
                     innovation = nu;
                 } else {
                     outlier = true;
+                    outlier_at = Some(m);
                 }
             }
         }
@@ -1011,7 +1073,7 @@ impl Tbc {
             self.report.coasted_lines += 1;
         } else {
             self.misses = 0;
-            if self.searching {
+            if self.searching && !self.relevel {
                 self.searching = false;
             }
         }
@@ -1031,7 +1093,15 @@ impl Tbc {
             .iter()
             .filter(|p| p.kind == PulseKind::H && p.start > t_start + w && p.start < t_start + self.p - w)
             .map(|p| p.start - t_start)
-            .next_back();
+            .next_back()
+            // A pulse near the prediction but outside the gate is a relock
+            // candidate too. Without this, pulses that moved by more than
+            // the gate but less than the search window were neither
+            // accepted nor off-grid: the flywheel coasted on a wrong phase
+            // until the full search after coast_lines, with the level
+            // windows on the wrong part of the line (fields dark or washed
+            // out, without colour).
+            .or(outlier_at.map(|m| m - t_start));
         let missing = measured.is_none() || outlier;
         self.relock_hist.push_back(if missing { off } else { None });
         let need = if self.expect_jump { 1 } else { self.cfg.relock_pulses.max(1) as usize };
@@ -1070,6 +1140,44 @@ impl Tbc {
         }
         if self.misses > self.cfg.coast_lines {
             self.searching = true;
+        }
+        // Collapsed levels (after fades and clipping): tip and blank pulled
+        // toward each other, the gate (a share of the depth) then refuses
+        // the good readings and the slicer, half way between them, misses
+        // real pulses, so whole fields coast at good C/N with the picture
+        // scaled many times over. Search now (the percentile threshold does
+        // not use the levels) and let the next lock measure them again.
+        if !self.relevel && self.lv.valid && self.ref_depth > 0.0 {
+            let d = self.lv.blank.x - self.lv.tip.x;
+            if d < 0.5 * self.ref_depth || d > 2.0 * self.ref_depth {
+                self.relevel = true;
+                self.searching = true;
+                self.report.level_resets += 1;
+            }
+        }
+        // Levels moved away from the slicer while coasting: the demodulated
+        // signal shifted (and its sync depth changed) so the threshold sits
+        // outside it and no pulse is seen at all, although the carrier is
+        // strong. The tracked levels only update on measured lines, so the
+        // check above cannot see this; without it the flywheel coasts blind
+        // for `coast_lines` lines, although a search finds the pulses at
+        // once.
+        if self.cfg.blind_lines > 0 && !self.searching && self.lv.valid && self.has_mag {
+            let (a, b) = (t_start - w, t_start + self.p - w);
+            let any = self.pulses.iter().any(|p| p.start >= a && p.start < b);
+            if any || !self.line_strong(t_start, t_start + self.p) {
+                self.blind = 0;
+            } else {
+                self.blind += 1;
+                if self.blind >= self.cfg.blind_lines {
+                    self.blind = 0;
+                    self.relevel = true;
+                    self.searching = true;
+                    self.report.level_resets += 1;
+                }
+            }
+        } else {
+            self.blind = 0;
         }
         // Emit the line [t_start, line_end).
         let lpf_frame = par.lines_per_frame;
@@ -1288,6 +1396,12 @@ impl Tbc {
         let mut noise_meas = Vec::new();
         if matches!(kind_lv, PulseKind::H | PulseKind::Eq) {
             if let Some((m, var, n)) = self.mean_range(t0 + bw0, t0 + bw1) {
+                // An H window holds the burst: its spread is not noise.
+                let var = if kind_lv == PulseKind::H {
+                    self.blank_flat_var(t0, par).unwrap_or(var)
+                } else {
+                    var
+                };
                 let r = (self.lv.noise.powi(2)).max(var) / neff(n);
                 let gate = 0.15 * (self.lv.blank.x - self.lv.tip.x);
                 if self.lv.blank.update(m, r, q_b, gate) {

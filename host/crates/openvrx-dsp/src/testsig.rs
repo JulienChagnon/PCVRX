@@ -422,6 +422,8 @@ pub struct SigGen {
     pub lines: Vec<LineTruth>,
     // Previous bus sample (for mixed reads): quantised word.
     prev_word: u32,
+    /// Camera line-timing wobble: peak offset (s) and seed (0 = off).
+    wobble: (f64, u64),
 }
 
 impl SigGen {
@@ -483,6 +485,7 @@ impl SigGen {
             next_line: 0,
             lines: Vec::new(),
             prev_word: 0,
+            wobble: (0.0, 0),
         };
         // Signal power after the channel: measure on a clean copy of the
         // first line.
@@ -509,6 +512,7 @@ impl SigGen {
                 next_line: u64::MAX,
                 lines: Vec::new(),
                 prev_word: 0,
+                wobble: (0.0, 0),
             };
             let mut acc = 0.0;
             let n = 12000;
@@ -537,6 +541,13 @@ impl SigGen {
         self.gain *= rms_adc / self.spec.rms_adc;
         self.spec.rms_adc = rms_adc;
         self.spec.dc = dc;
+    }
+
+    /// Changes the FM deviation scale and the blanking frequency from the
+    /// next sample on: the demodulated levels move (sync depth and offset).
+    pub fn set_modulation(&mut self, deviation: f64, blank_hz: f64) {
+        self.spec.deviation = deviation;
+        self.spec.blank_hz = blank_hz;
     }
 
     /// Sets the C/N from the next sample on (None = no noise). The signal
@@ -587,12 +598,42 @@ impl SigGen {
         ((x % lpf) as u16 + 1, x / lpf)
     }
 
+    /// Camera line-timing wobble from the next line on: line g starts
+    /// `offset(g)` late (sync and picture together, as a camera's timing
+    /// generator moves both), constant over runs of 3 lines and uniform in
+    /// +-`peak_us`. 0 turns it off.
+    pub fn set_line_wobble(&mut self, peak_us: f64, seed: u64) {
+        self.wobble = (peak_us * 1e-6, seed);
+    }
+
+    /// Start offset of TX line `g` (seconds).
+    fn line_offset(&self, g: f64) -> f64 {
+        let (peak, seed) = self.wobble;
+        if peak == 0.0 || g < 0.0 {
+            return 0.0;
+        }
+        let mut z = seed ^ (g as u64 / 3).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let u = (z >> 11) as f64 / (1u64 << 53) as f64; // [0, 1)
+        peak * (2.0 * u - 1.0)
+    }
+
     /// Clean IRE at TX time.
     pub fn ire_at(&self, t_tx: f64) -> f64 {
         let tl = 1.0 / self.spec.standard.params().line_hz;
-        let g = (t_tx / tl).floor();
+        let mut g = (t_tx / tl).floor();
+        if self.wobble.0 != 0.0 {
+            // The line whose (moved) start is the last one at or before t.
+            if t_tx < g * tl + self.line_offset(g) {
+                g -= 1.0;
+            } else if t_tx >= (g + 1.0) * tl + self.line_offset(g + 1.0) {
+                g += 1.0;
+            }
+        }
         let (l, frame) = self.line_of(g.max(0.0) as u64);
-        self.raster.ire(frame, l, (t_tx - g * tl) * 1e6, t_tx)
+        self.raster.ire(frame, l, (t_tx - g * tl - self.line_offset(g)) * 1e6, t_tx)
     }
 
     /// Truth for one grid line whose 0H was reported at `src_position`
@@ -741,12 +782,12 @@ impl SigGen {
         let p = self.spec.standard.params();
         let lpf0 = p.lines_per_field[0];
         loop {
-            let t0 = self.next_line as f64 * tl + if self.spec.start_us > 0.0 { tl } else { 0.0 };
+            let g = self.next_line + if self.spec.start_us > 0.0 { 1 } else { 0 };
+            let t0 = g as f64 * tl + self.line_offset(g as f64);
             let h0 = self.out_pos(t0) + self.channel_delay();
             if h0 >= self.out_index as f64 {
                 break;
             }
-            let g = self.next_line + if self.spec.start_us > 0.0 { 1 } else { 0 };
             let (l, _) = self.line_of(g);
             self.lines.push(LineTruth {
                 h0,

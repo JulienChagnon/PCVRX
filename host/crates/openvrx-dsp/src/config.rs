@@ -324,6 +324,12 @@ pub struct SyncConfig {
     pub level_noise_ire: f32,
     /// Search window around the prediction (us).
     pub window_us: f32,
+    /// Smallest gate (us) for accepting a pulse as a timing measurement; the
+    /// gate is otherwise 4 sigma of the predicted innovation, which on a
+    /// clean signal is far below the line-to-line timing wobble of FPV
+    /// cameras: a pulse the camera really sent there was refused and the
+    /// flywheel snapped back to it with a relock a few lines later.
+    pub gate_min_us: f32,
     /// Emit lines before the first vertical sync after this many fields.
     pub provisional_fields: u32,
     /// Segment length (us) for the per-segment envelope C/N grading of the
@@ -333,6 +339,15 @@ pub struct SyncConfig {
     /// Segments with an envelope C/N at or above this get no grading;
     /// lower C/N grades linearly up to `damage::NOISY` at 0 dB.
     pub segment_clean_db: f32,
+    /// Lines in a row with no sync pulse of any kind while the carrier is
+    /// strong (envelope C/N at least `blind_cn_db`) before the slicer levels
+    /// count as lost and the tracker searches again (0 disables). Every
+    /// video line holds a pulse (horizontal, equalising or broad), so this
+    /// only happens when the demodulated levels moved away from the slicer
+    /// threshold, which coasting never corrects (it waits `coast_lines`).
+    pub blind_lines: u32,
+    /// Envelope C/N (dB) a line needs to count towards `blind_lines`.
+    pub blind_cn_db: f32,
 }
 
 impl Default for SyncConfig {
@@ -344,9 +359,12 @@ impl Default for SyncConfig {
             period_noise: 0.0005,
             level_noise_ire: 0.15,
             window_us: 1.6,
+            gate_min_us: 0.4,
             provisional_fields: 2,
             segment_us: 4.0,
             segment_clean_db: 15.0,
+            blind_lines: 8,
+            blind_cn_db: 14.0,
         }
     }
 }

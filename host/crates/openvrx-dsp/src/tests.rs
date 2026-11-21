@@ -336,6 +336,114 @@ fn coasts_through_carrier_dropout() {
     assert_eq!(r.dsp.stats().lock, LockState::Locked);
 }
 
+/// The demodulated levels move while the carrier stays strong (sync depth
+/// less than half, everything shifted up) so that the slicer threshold of
+/// the old levels lies below every sample: no pulse is seen at all. The
+/// tracker must search again within a few lines instead of coasting blind
+/// for `coast_lines`.
+#[test]
+fn relevels_when_the_slicer_sees_no_pulses_at_good_cn() {
+    let spec = SigSpec {
+        cn_db: Some(28.0),
+        ..SigSpec::default()
+    };
+    let line = (spec.sample_format.sample_rate_hz() / VideoStandard::Ntsc.params().line_hz) as usize;
+    let outcome = |blind_lines: u32| {
+        let mut cfg = cfg_for(&spec);
+        cfg.sync.blind_lines = blind_lines;
+        let mut r = run(spec.clone(), cfg, secs(&spec, 0.08), 4096);
+        assert_eq!(r.dsp.stats().lock, LockState::Locked);
+        let before = r.lines.len();
+        // Old: tip -2.9 MHz, blank -1.0 MHz, slicer about -2.0 MHz. New:
+        // tip -1.4 MHz, so nothing crosses the old slicer.
+        r.gen.set_modulation(0.45, -0.5e6);
+        feed(&mut r, 120 * line, 4096);
+        let after: Vec<&LineRecord> = r.lines[before..].iter().collect();
+        // The first line from which every non-VBI line has a measured pulse again.
+        let last_fly = after
+            .iter()
+            .rposition(|l| l.quality.flags.contains(LineFlags::FLYWHEEL) && !l.quality.flags.contains(LineFlags::VBI))
+            .map_or(0, |i| i + 1);
+        (last_fly, after.len())
+    };
+    let (with, n) = outcome(SyncConfig::default().blind_lines);
+    assert!(n > 100, "{n} lines");
+    assert!(with < 40, "still coasting {with} lines after the level change");
+    // Without the check the flywheel coasts blind past the end of the run.
+    let (without, n) = outcome(0);
+    assert!(without + 5 >= n, "without the check it recovered after {without} of {n} lines");
+}
+
+/// Line-start error against the camera's true line start, over every
+/// emitted line after `from` (coasted lines included: they are shown too):
+/// RMS about the mean in us, and the share of FLYWHEEL lines.
+fn start_error(r: &Run, from: usize) -> (f64, f64) {
+    let us = 1e6 / r.gen.sample_rate();
+    let ls = &r.lines[from..];
+    let errs: Vec<f64> = ls.iter().map(|l| (l.src_position - nearest(r, l).h0) * us).collect();
+    let n = errs.len().max(1) as f64;
+    let mean = errs.iter().sum::<f64>() / n;
+    let rms = (errs.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / n).sqrt();
+    let fly = ls.iter().filter(|l| l.quality.flags.contains(LineFlags::FLYWHEEL)).count() as f64 / n;
+    (rms, fly)
+}
+
+fn wobble_run(gate_us: f32, cn: f64, wobble_us: f64) -> (f64, f64) {
+    wobble_run_pn(gate_us, SyncConfig::default().phase_noise, cn, wobble_us)
+}
+
+fn wobble_run_pn(gate_us: f32, phase_noise: f32, cn: f64, wobble_us: f64) -> (f64, f64) {
+    let spec = SigSpec {
+        cn_db: Some(cn),
+        ..SigSpec::default()
+    };
+    let mut cfg = cfg_for(&spec);
+    cfg.sync.gate_min_us = gate_us;
+    cfg.sync.phase_noise = phase_noise;
+    let mut r = run(spec.clone(), cfg, secs(&spec, 0.04), 4096);
+    let from = r.lines.len();
+    r.gen.set_line_wobble(wobble_us, 7);
+    feed(&mut r, secs(&spec, 0.1), 4096);
+    start_error(&r, from + 30)
+}
+
+/// A camera whose line timing wobbles by a few tenths of a microsecond:
+/// the gate takes its pulses as measurements instead of coasting on the
+/// prediction and snapping back with relocks.
+#[test]
+fn accepts_camera_line_timing_wobble() {
+    let (rms_new, fly_new) = wobble_run(SyncConfig::default().gate_min_us, 25.0, 0.3);
+    let (rms_old, fly_old) = wobble_run(0.08, 25.0, 0.3);
+    assert!(fly_new < 0.2 * fly_old, "flywheel {fly_new:.3} vs {fly_old:.3} with the narrow gate");
+    assert!(rms_new < 0.9 * rms_old, "start error {rms_new:.3} us vs {rms_old:.3} us");
+}
+
+/// Gate floor against wobble and C/N: `cargo test -p openvrx-dsp --release -- --ignored diag_gate --nocapture`.
+#[test]
+#[ignore]
+fn diag_gate_wobble() {
+    // PN: flywheel phase noise values (input samples). A large one makes
+    // the line start follow a camera's wobble on a clean signal, but it also
+    // follows edge noise (SINAD), blurs the period (line rate) and lets the
+    // prediction wander onto noise pulses in a dropout, so it stays small.
+    let pns: Vec<f32> = std::env::var("PN")
+        .ok()
+        .map_or(vec![SyncConfig::default().phase_noise], |s| s.split(',').filter_map(|x| x.parse().ok()).collect());
+    let gates: Vec<f32> = std::env::var("GATES").ok().map_or(vec![0.08, 0.25, 0.4, 0.6], |s| s.split(',').filter_map(|x| x.parse().ok()).collect());
+    for pn in pns {
+        for wob in [0.0, 0.3, 0.5] {
+            for cn in [25.0, 14.0, 10.0, 8.0] {
+                let mut row = format!("pn {pn} wobble {wob:.1} us, C/N {cn:4.1}:");
+                for &gate in &gates {
+                    let (rms, fly) = wobble_run_pn(gate, pn, cn, wob);
+                    row += &format!("  gate {gate:.2}: rms {rms:.3} us fly {:4.1} %", 100.0 * fly);
+                }
+                println!("{row}");
+            }
+        }
+    }
+}
+
 #[test]
 fn recovers_from_usb_gaps() {
     let spec = SigSpec {
