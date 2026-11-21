@@ -312,7 +312,10 @@ impl PredetectCombiner {
     /// Produces every combined sample the buffered data allows.
     pub fn pull(&mut self, out: &mut Vec<Complex32>) {
         if !self.started {
-            self.n_out = self.br[0].base;
+            // The interpolator reads 3 samples before the output position
+            // (the loop below needs base + 4): starting at base itself
+            // never produced a sample.
+            self.n_out = self.br[0].base + 4;
             self.started = true;
         }
         for k in 1..self.br.len() {
@@ -373,13 +376,19 @@ impl PredetectCombiner {
         let l = self.cfg.acq_len.next_power_of_two();
         let s = self.cfg.search;
         let r_end = self.br[0].end();
+        // The search runs `s` samples either side of the guess (plus one for
+        // the fractional peak), so the reference window ends that far before
+        // the newest sample. Ending it at the newest sample put the late half
+        // of the search past the end of a branch that is level with the
+        // reference, and such a branch never acquired.
+        let margin = s as u64 + 2;
         let b = &self.br[k];
-        if r_end < self.br[0].base + l as u64 || b.re.len() < l + 2 * s || b.end() < b.next_acq {
+        if r_end < self.br[0].base + l as u64 + margin || b.re.len() < l + 2 * s || b.end() < b.next_acq {
             return;
         }
         // Initial guess: map the reference window end to the branch through
         // the latest push times (both streams live), else by stream ends.
-        let r_win_end = r_end;
+        let r_win_end = r_end - margin;
         let r_win_start = r_win_end - l as u64;
         let guess_end = match (self.br[0].last_push, b.last_push) {
             (Some((tr, er)), Some((tb, eb))) if tr > 0 && tb > 0 => {
@@ -443,7 +452,9 @@ impl PredetectCombiner {
         }
         // z_r conj(z_b) rotates at w_p = 2 pi bin / l = w_r - w_b; the
         // branch must be rotated by exp(-j (w_b - w_r) n) = exp(+j w_p n).
-        let w_rel = -std::f64::consts::TAU * bin / l as f64;
+        // (rustfft's forward transform puts a tone exp(+j w n) at the
+        // positive bin w l / 2 pi, so w_p = +2 pi bin / l.)
+        let w_rel = std::f64::consts::TAU * bin / l as f64;
         // Fractional delay and rate from complex correlation peaks of both
         // halves.
         let half = l / 2;
@@ -653,7 +664,9 @@ impl PredetectCombiner {
             let gd = self.cfg.delay_gain as f64 * rel;
             b.freq += 0.25 * gp * gp * e_ph / bl as f64;
             b.phase = wrap_pi64(b.phase + b.freq * bl as f64 + gp * e_ph);
-            b.rate += 0.05 * gd * gd * e_d / bl as f64;
+            // The position moves by -gd e_d (below), so the rate integrates
+            // the same sign; with +e_d it ran into its clamp.
+            b.rate -= 0.05 * gd * gd * e_d / bl as f64;
             b.rate = b.rate.clamp(1.0 - 3e-4, 1.0 + 3e-4);
             b.pos += b.rate * bl as f64 - gd * e_d;
             // Lost lock: decorrelated while the branch itself is strong.
