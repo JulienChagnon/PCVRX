@@ -112,12 +112,15 @@ are then unconnected and the firmware's low drive on them is harmless.
 The XIAO needs its back pads for 6x6 and 7x7: use headers or wire the pads
 before soldering the board down.
 
-### XIAO 7x7 beside the FX2 mini board (default 7x7 pinout)
+### XIAO beside the FX2 mini board (`board xiao7x7`, run as 6x6)
 
-The default 7x7 wiring. It routes each FX2 pin from the nearest C5 pin, so
-the wires are short and mostly straight; the C5 firmware moves the lanes to
-match (the host side is unchanged: the FX2 word is the same as in the table
-above). The 4x4 bench wiring (8-bit table below) stays as it is.
+The default wiring for the XIAO on the FX2 mini board, run with `lanes 6x6`.
+It routes each FX2 pin from a nearby C5 pin, so the wires are short and
+mostly straight; the C5 firmware moves the lanes to match (the host side is
+unchanged: the FX2 word is the same as in the table above). D4 and D2 sit on
+PB1 and PD1, the lowest bits: under 6x6 the C5 holds them low, and `lanes
+7x7` uses them as the seventh bits with no rewire. The 4x4 bench wiring
+(8-bit table below) stays as it is.
 
 Layout: the XIAO sits between the FX2 board's two 2x10 headers. Its D0..D6
 column lines up with rows 1..7 of the FX2 left header, and its VBUS, GND,
@@ -145,11 +148,11 @@ FX2 left header and the XIAO D0 column:
 |---|---|---|
 | D0 (GPIO1) | PD5 (1 L) | I7 |
 | D1 (GPIO0) | PD7 (2 L) | I9 |
-| D2 (GPIO25) | PD6 (1 R) | I8 |
+| D2 (GPIO25) | PD1 (right header, 2 R) | I3 (held low in 6x6) |
 | D3 (GPIO7) | PB3 (9 R) | Q5 |
-| D4 (GPIO23) | PB2 (9 L) | Q4 |
+| D4 (GPIO23) | PB1 (8 R) | Q3 (held low in 6x6) |
 | D5 (GPIO24) | IFCLK (6 R) | sample clock: keep it straight and short, its return is the GND at 6 L |
-| D6 (GPIO11) | PB1 (8 R) | Q3 |
+| D6 (GPIO11) | PB2 (9 L) | Q4 |
 
 FX2 right header and the XIAO VBUS column and back pads:
 
@@ -157,7 +160,7 @@ FX2 right header and the XIAO VBUS column and back pads:
 |---|---|---|
 | MTDO pad (GPIO5) | PD3 (1 R) | I5 |
 | MTDI pad (GPIO3) | PD4 (1 L) | I6 |
-| MTCK pad (GPIO4) | PD1 (2 R) | I3 |
+| MTCK pad (GPIO4) | PD6 (left header, 1 R) | I8 |
 | MTMS pad (GPIO2) | PD2 (2 L) | I4 |
 | D10 (GPIO10) | PB6 (9 R) | Q8 |
 | D9 (GPIO9) | PB7 (9 L) | Q9 |
@@ -197,8 +200,9 @@ Power and ground:
   C5 to two free GPIOs (the BOOT pad, GPIO28, is unused); tied to GND they
   read 0 as in the table above.
 
-Firmware: select this map with `board xiao7x7`, then `lanes 7x7` (6x6 and
-5x5 also fit; no 8-bit preset does, PB0 is tied to GND). `board xiao`
+Firmware: select this map with `board xiao7x7`, then `lanes 6x6` and
+`clk 15` (16 MS/s, 32 MB/s; 7x7 and 5x5 also fit; no 8-bit preset does,
+PB0 is tied to GND). `board xiao`
 keeps the tables above for the 4x4 wiring. After wiring, run `fx2_diag`
 (it must show `RDY1 / SLWR low` and `RDY0 / SLRD high`, chip signals)
 before the first stream, then `selftest walk` to check every lane.

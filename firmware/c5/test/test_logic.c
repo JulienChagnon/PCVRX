@@ -202,14 +202,17 @@ static void test_boards(void)
     CHECK(openvrx_route(x7, OPENVRX_PRESET_4X4TOP, &r, &missing) == OPENVRX_ROUTE_NO_FIT);
     CHECK(openvrx_route(x7, OPENVRX_PRESET_7X7, &r, NULL) == OPENVRX_ROUTE_OK);
     CHECK(r.n == 14 && (r.used_mask | (1u << r.clk)) == xm && r.idle_mask == 0 && r.spare_mask == 0);
-    // HARDWARE.md table: Q3 D6 (GPIO11), Q9 D9 (GPIO9), I3 MTCK (GPIO4), I9 D1 (GPIO0).
-    CHECK(r.lane[0].word_bit == 1 && r.lane[0].comp == 'Q' && r.lane[0].adc_bit == 3 && r.gpio[0] == 11);
+    // HARDWARE.md table: Q3 D4 (GPIO23), Q9 D9 (GPIO9), I3 D2 (GPIO25), I9 D1 (GPIO0).
+    CHECK(r.lane[0].word_bit == 1 && r.lane[0].comp == 'Q' && r.lane[0].adc_bit == 3 && r.gpio[0] == 23);
     CHECK(r.lane[6].word_bit == 7 && r.lane[6].adc_bit == 9 && r.gpio[6] == 9);
-    CHECK(r.lane[7].word_bit == 9 && r.lane[7].comp == 'I' && r.lane[7].adc_bit == 3 && r.gpio[7] == 4);
+    CHECK(r.lane[7].word_bit == 9 && r.lane[7].comp == 'I' && r.lane[7].adc_bit == 3 && r.gpio[7] == 25);
     CHECK(r.lane[13].word_bit == 15 && r.lane[13].adc_bit == 9 && r.gpio[13] == 0);
-    // 5x5 on this wiring: bits 4 and 3 (D4, D6, MTMS, MTCK) driven low.
+    // 6x6, the wiring's preset: bit 3 (D4, D2) driven low.
+    CHECK(openvrx_route(x7, OPENVRX_PRESET_6X6, &r, NULL) == OPENVRX_ROUTE_OK);
+    CHECK(r.n == 12 && r.idle_mask == ((1u << 23) | (1u << 25)) && r.spare_mask == 0);
+    // 5x5: bits 4 and 3 (D4, D6, D2, MTMS) driven low.
     CHECK(openvrx_route(x7, OPENVRX_PRESET_5X5, &r, NULL) == OPENVRX_ROUTE_OK);
-    CHECK(r.idle_mask == ((1u << 11) | (1u << 23) | (1u << 4) | (1u << 2)));
+    CHECK(r.idle_mask == ((1u << 23) | (1u << 11) | (1u << 25) | (1u << 2)));
     openvrx_board_id_t id7;
     CHECK(openvrx_board_parse("xiao7x7", &id7) && id7 == OPENVRX_BOARD_XIAO7X7);
     CHECK_STR(openvrx_board_name(OPENVRX_BOARD_XIAO7X7), "xiao7x7");

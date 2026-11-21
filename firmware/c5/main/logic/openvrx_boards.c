@@ -46,11 +46,13 @@ static const openvrx_board_map_t s_zero = {
 // PB3..PB1); D10..D7 and the four back pads face the right header
 // (PD4..PD1, PB7..PB4). Clock on D5 (GPIO24, not a strapping pin), beside
 // an FX2 GND. 16-bit only: PB0 and PD0 are tied to GND, no 8-bit preset fits.
+// Wired for 6x6: D4 (GPIO23) and D2 (GPIO25) sit on PB1 and PD1, the lowest
+// bits, so under `lanes 6x6` they are idle pins driven low; 7x7 uses them.
 static const openvrx_board_map_t s_xiao7x7 = {
     .name = "xiao7x7",
     .clk = 24,
-    .w16 = {-1, 11, 23, 7, 8, 12, 10, 9,   // PB0..PB7: Q (PB0 tied to GND)
-            -1, 4, 2, 5, 3, 1, 25, 0},     // PD0..PD7: I (PD0 tied to GND)
+    .w16 = {-1, 23, 11, 7, 8, 12, 10, 9,   // PB0..PB7: Q (PB0 tied to GND)
+            -1, 25, 2, 5, 3, 1, 4, 0},     // PD0..PD7: I (PD0 tied to GND)
     .w8 = {-1, -1, -1, -1, -1, -1, -1, -1},
 };
 
