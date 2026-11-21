@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The preset switch overlay: on a preset change (arrow keys or the menu) a
-//! strip with the previous, current and next preset slides in from the side
+//! The picture mode switch overlay: on a mode change (arrow keys or the menu) a
+//! strip with the previous, current and next mode slides in from the side
 //! the step came from, holds, then fades. It is drawn on its own foreground
 //! layer and never takes input, so it cannot get in the way of the picture.
 
@@ -35,7 +35,7 @@ impl PresetSwitch {
     }
 
     /// Draws the strip for `current`; `note` is shown under the description
-    /// (cleanup off, no plugin). Asks for repaints while it is on screen.
+    /// (plugin mode with no plugin set). Asks for repaints while it is on screen.
     pub fn draw(&mut self, ctx: &egui::Context, current: VideoPreset, note: Option<&str>, now_ns: u64) {
         let Some(t0) = self.started_ns else { return };
         let t = now_ns.saturating_sub(t0);
@@ -103,7 +103,7 @@ impl PresetSwitch {
         p.text(
             Pos2::new(centre.x, centre.y - CARD.y / 2.0 - 10.0),
             Align2::CENTER_BOTTOM,
-            "\u{2190}  preset  \u{2192}",
+            "\u{2190}  picture mode  \u{2192}",
             FontId::proportional(11.0),
             DIM.gamma_multiply(alpha),
         );

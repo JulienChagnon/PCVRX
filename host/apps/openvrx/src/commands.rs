@@ -23,7 +23,7 @@ pub enum AppCommand {
     ConfigureReceiver { rx: RxId, config: ReceiverSettings },
     /// Run the sampling-phase probe and slip until clean.
     Calibrate { rx: RxId },
-    /// Video pipeline configuration (preset, cleanup master switch).
+    /// Video pipeline configuration (picture mode, standard, diversity).
     SetVideo(VideoSettings),
     StartRecording { folder: PathBuf },
     StopRecording,

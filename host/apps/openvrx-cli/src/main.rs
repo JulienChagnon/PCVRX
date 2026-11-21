@@ -506,7 +506,14 @@ fn record(base: &str, args: &[String]) -> Result<(), String> {
     info.gain = gain;
     info.board = settings.board.name().to_string();
     info.start_host_ns = openvrx_core::clock::now_ns();
-    let sidecar = Sidecar::new(RecordingSource::Hardware, vec![info]);
+    let mut sidecar = Sidecar::new(RecordingSource::Hardware, vec![info]);
+    sidecar.context = openvrx_format::host_context();
+    if let Some(dir) = std::path::Path::new(base).parent().filter(|d| !d.as_os_str().is_empty()) {
+        sidecar.context.insert(
+            "output".into(),
+            serde_json::json!({ "folder": dir.display().to_string(), "fs": openvrx_format::fs_type(dir) }),
+        );
+    }
     // `-` as OUT_BASE: a drain. The same capture path, but the blocks are
     // only counted, so losses come from USB and the FX2 FIFO, never the disk.
     let drain = base == "-";

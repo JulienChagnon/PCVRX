@@ -114,7 +114,7 @@ pub fn video_config(v: &VideoSettings, standard: VideoStandard) -> VideoConfig {
 /// plugin preset its info names the pipeline, and its geometry overrides
 /// the steady OSD setting.
 pub fn video_config_with(v: &VideoSettings, standard: VideoStandard, plugin: Option<&PluginInfo>) -> VideoConfig {
-    let preset = v.effective_preset();
+    let preset = v.preset;
     let plugin = plugin.filter(|_| preset.uses_plugin());
     let name = plugin.map_or(preset.pipeline_name(), |i| i.pipeline.as_str());
     let mut cfg = VideoConfig::preset(name, standard).unwrap_or_else(|| VideoConfig::raw(standard));
@@ -236,6 +236,12 @@ enum RecMsg {
     /// the pins, which leave no position jump in the stream. `byte` is a
     /// stream position.
     FifoFull { rx: RxId, polls: u64, byte: u64, host_ns: u64 },
+    /// An app event (picture mode change, once-a-second stats). One with a
+    /// receiver and no byte gets that receiver's file size when it is
+    /// written: where in the file it happened, give or take the queue.
+    Event(Event),
+    /// A key of the sidecar's `context`, set before it is rewritten at close.
+    Context(String, serde_json::Value),
 }
 
 /// Recorder input shared by all DSP threads (blocks) and the backend
@@ -580,7 +586,7 @@ impl ViewPlugin {
 fn plugin_report(plugin: &Option<ViewPlugin>, v: &VideoSettings) -> Option<FilterReport> {
     match plugin {
         Some(vp) => Some(vp.filter.report()),
-        None if v.effective_preset().uses_plugin() => Some(FilterReport::failed(
+        None if v.preset.uses_plugin() => Some(FilterReport::failed(
             Path::new("none"),
             "no plugin library set (video.plugin_path, or --plugin)",
         )),
@@ -770,6 +776,112 @@ struct Recorder {
 /// that finds the FIFO full stands for about this much of the samples lost.
 const FIFO_POLL_US: f64 = 0.833;
 
+/// How often a recording logs the receivers' and the app's state.
+const REC_STATS_NS: u64 = 1_000_000_000;
+
+/// Hands an app message to the recorder while one runs. Never blocks: a
+/// full queue means the disk is behind, and the raw blocks matter more.
+fn rec_send(st: &State, msg: RecMsg) {
+    if let Some(live) = st.live.as_ref() {
+        if let Some(tx) = live.tap.tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.try_send(msg);
+        }
+    }
+}
+
+/// An app event of the given kind; `fields` (an object) become its keys.
+fn app_event(rx: Option<RxId>, kind: &str, fields: serde_json::Value) -> Event {
+    let fields = match fields {
+        serde_json::Value::Object(m) => m,
+        v => serde_json::Map::from_iter([("value".to_string(), v)]),
+    };
+    Event::new(rx, now_ns(), None, EventKind::Other { kind: kind.into(), fields })
+}
+
+/// The picture mode and every video setting, for the sidecar and events.
+fn video_json(v: &VideoSettings) -> serde_json::Value {
+    serde_json::json!({ "picture_mode": v.preset.name(), "video": v })
+}
+
+/// A receiver's live state: the decoder's statistics, the USB stream's
+/// counters, lines the DSP thread dropped, the gain the app knows.
+fn rx_snapshot(r: &LiveRx) -> serde_json::Value {
+    let stats = r.dsp.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    serde_json::json!({
+        "stats": stats,
+        "stream": r.receiver.stream_stats(),
+        "dsp_lines_dropped": r.dsp.shared.lines_dropped.load(Ordering::Relaxed),
+        "gain": r.gain,
+        "connected": r.connected,
+    })
+}
+
+/// What each open view shows and has lost.
+fn views_json(st: &State) -> serde_json::Value {
+    let views: Vec<serde_json::Value> = st
+        .views
+        .iter()
+        .enumerate()
+        .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+        .map(|(k, v)| {
+            let filter = v.health.filter.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|f| f.osd_line());
+            serde_json::json!({
+                "view": k,
+                "rx": v.rxs,
+                "lost_lines": v.health.lost_lines.load(Ordering::Relaxed),
+                "rebuilds": v.health.rebuilds.load(Ordering::Relaxed),
+                "filter": filter,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(views)
+}
+
+/// The sidecar's `context.summary` at the end: how long, what was lost and
+/// where (recorder queue, FX2 FIFO, USB stream, views), the picture mode and
+/// video settings at the end, and the host's load.
+fn recording_summary(st: &State) -> serde_json::Value {
+    let Some(rec) = st.recorder.as_ref() else {
+        return serde_json::Value::Null;
+    };
+    let video = st.video.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (rx, queue_dropped) = match st.live.as_ref() {
+        Some(live) => (
+            live.rxs.iter().map(rx_snapshot).collect::<Vec<_>>(),
+            live.tap.dropped.load(Ordering::Relaxed),
+        ),
+        None => (Vec::new(), 0),
+    };
+    let polls = rec.fifo_polls.load(Ordering::Relaxed);
+    serde_json::json!({
+        "ended_utc": openvrx_format::utc_now_string(),
+        "duration_s": now_ns().saturating_sub(rec.started_ns) as f64 / 1e9,
+        "bytes": rec.bytes.load(Ordering::Relaxed),
+        "rec_queue_dropped_blocks": queue_dropped,
+        "fifo_full_polls": polls,
+        "fifo_lost_ms_est": polls as f64 * FIFO_POLL_US / 1e3,
+        "end": video_json(&video),
+        "views": views_json(st),
+        "host": openvrx_format::host_load(),
+        "rx": rx,
+    })
+}
+
+/// Once a second while recording: an `rx_stats` event per receiver and an
+/// `app_stats` event (host load, recorder queue drops, views).
+fn record_stats(st: &State) {
+    let Some(live) = st.live.as_ref() else { return };
+    for r in &live.rxs {
+        rec_send(st, RecMsg::Event(app_event(Some(r.rx), "rx_stats", rx_snapshot(r))));
+    }
+    let app = serde_json::json!({
+        "host": openvrx_format::host_load(),
+        "rec_queue_dropped": live.tap.dropped.load(Ordering::Relaxed),
+        "views": views_json(st),
+    });
+    rec_send(st, RecMsg::Event(app_event(None, "app_stats", app)));
+}
+
 fn recorder_loop(
     mut writer: RecordingWriter,
     msgs: MpscReceiver<RecMsg>,
@@ -789,6 +901,23 @@ fn recorder_loop(
                         fifo_polls.fetch_add(polls, Ordering::Relaxed);
                     }
                 })
+            }
+            RecMsg::Event(mut ev) => {
+                match (ev.rx, ev.byte, &mut ev.kind) {
+                    (Some(rx), None, _) => ev.byte = Some(writer.bytes_written(rx)),
+                    // An app-wide event: every receiver's file size, in rx order.
+                    (None, None, EventKind::Other { fields, .. }) => {
+                        let at: Vec<u64> =
+                            writer.sidecar().receivers.iter().map(|r| writer.bytes_written(r.rx)).collect();
+                        fields.insert("file_bytes".into(), serde_json::json!(at));
+                    }
+                    _ => {}
+                }
+                writer.log_event(&ev)
+            }
+            RecMsg::Context(key, value) => {
+                writer.sidecar_mut().context.insert(key, value);
+                Ok(())
             }
         };
         if let Err(e) = result {
@@ -1104,6 +1233,7 @@ pub fn run(ctx: BackendContext) {
         hw_error: None,
     };
     let mut last_status = 0u64;
+    let mut last_rec_stats = 0u64;
     loop {
         match ctx.next_command(Duration::from_millis(20)) {
             Ok(Some(AppCommand::Shutdown)) | Err(()) => break,
@@ -1115,6 +1245,10 @@ pub fn run(ctx: BackendContext) {
         if now - last_status >= STATUS_NS {
             publish_status(&ctx, &mut st);
             last_status = now;
+        }
+        if st.recorder.is_some() && now - last_rec_stats >= REC_STATS_NS {
+            record_stats(&st);
+            last_rec_stats = now;
         }
     }
     stop_recording(&ctx, &mut st);
@@ -1181,7 +1315,17 @@ fn handle(ctx: &BackendContext, st: &mut State, cmd: AppCommand) {
             }
         }
         AppCommand::SetVideo(v) => {
-            *st.video.lock().unwrap_or_else(|e| e.into_inner()) = v;
+            let changed = {
+                let mut cur = st.video.lock().unwrap_or_else(|e| e.into_inner());
+                let changed = *cur != v;
+                *cur = v.clone();
+                changed
+            };
+            // A recording notes every picture mode or video setting change,
+            // so a replay can be cut where the view changed.
+            if changed {
+                rec_send(st, RecMsg::Event(app_event(None, "video_settings", video_json(&v))));
+            }
         }
         AppCommand::StartRecording { folder } => start_recording(ctx, st, &folder),
         AppCommand::StopRecording => stop_recording(ctx, st),
@@ -1372,6 +1516,44 @@ fn configure(ctx: &BackendContext, st: &mut State, rx: RxId, config: ReceiverSet
     }
 }
 
+/// The sidecar's `context` at the start: build, host and command line, where
+/// it records to, and the app's state (picture mode, video and receiver
+/// settings, C5 versions, views, each receiver's statistics).
+fn recording_context(
+    st: &State,
+    live: &Live,
+    video: &VideoSettings,
+    folder: &Path,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut c = openvrx_format::host_context();
+    c.insert(
+        "output".into(),
+        serde_json::json!({ "folder": folder.display().to_string(), "fs": openvrx_format::fs_type(folder) }),
+    );
+    let receivers: Vec<serde_json::Value> = live
+        .rxs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "rx": r.rx,
+                "description": r.description,
+                "settings": r.settings,
+                "c5": r.receiver.c5().and_then(|c| c.version()),
+                "gain_loop_on_host": r.gain_loop.is_some(),
+            })
+        })
+        .collect();
+    let mut app = video_json(video);
+    if let serde_json::Value::Object(m) = &mut app {
+        m.insert("receivers".into(), serde_json::Value::Array(receivers));
+        m.insert("views".into(), views_json(st));
+    }
+    c.insert("app".into(), app);
+    let start: Vec<serde_json::Value> = live.rxs.iter().map(rx_snapshot).collect();
+    c.insert("start".into(), serde_json::json!({ "rx": start }));
+    c
+}
+
 fn start_recording(ctx: &BackendContext, st: &mut State, folder: &Path) {
     if st.recorder.is_some() {
         return;
@@ -1411,11 +1593,13 @@ fn start_recording(ctx: &BackendContext, st: &mut State, folder: &Path) {
         })
         .collect();
     let mut sidecar = Sidecar::new(RecordingSource::Hardware, infos);
-    sidecar.standard_hint = st.video.lock().unwrap_or_else(|e| e.into_inner()).standard.fixed();
+    let video = st.video.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    sidecar.standard_hint = video.standard.fixed();
     if let Err(e) = std::fs::create_dir_all(folder) {
         ctx.message(MessageLevel::Error, format!("{}: {e}", folder.display()));
         return;
     }
+    sidecar.context = recording_context(st, live, &video, folder);
     let base = recording_base(folder, &sidecar.created_utc);
     let writer = match RecordingWriter::create(&base, sidecar, WriterOptions::default()) {
         Ok(w) => w,
@@ -1453,6 +1637,12 @@ fn start_recording(ctx: &BackendContext, st: &mut State, folder: &Path) {
 }
 
 fn stop_recording(ctx: &BackendContext, st: &mut State) {
+    if st.recorder.is_none() {
+        return;
+    }
+    // The summary goes in while the queue is still open; the recorder sets
+    // it into the sidecar before the close rewrites it.
+    rec_send(st, RecMsg::Context("summary".into(), recording_summary(st)));
     let Some(mut rec) = st.recorder.take() else {
         return;
     };
@@ -1610,7 +1800,7 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
             .max_by(|a, b| a.cn_db.partial_cmp(&b.cn_db).unwrap_or(std::cmp::Ordering::Equal));
         let lock = best.map_or(LockState::NoSignal, |s| lock_state(s.lock));
         let freq = mine.first().map(|p| p.1.freq_mhz);
-        let preset = st.video.lock().unwrap_or_else(|e| e.into_inner()).effective_preset();
+        let preset = st.video.lock().unwrap_or_else(|e| e.into_inner()).preset;
         let lost = view.health.lost_lines.load(Ordering::Relaxed);
         let rebuilds = view.health.rebuilds.load(Ordering::Relaxed);
         let since = now_ns().saturating_sub(view.health.last_rebuild_ns.load(Ordering::Relaxed));
@@ -1698,12 +1888,46 @@ mod tests {
     }
 
     #[test]
+    fn recorder_writes_app_events_and_context() {
+        let dir = std::env::temp_dir().join(format!("openvrx-rec-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fmt = openvrx_core::SampleFormat::from_preset(LanePreset::I6Q6, 15);
+        let mut side = Sidecar::new(RecordingSource::Hardware, vec![ReceiverInfo::new(0, fmt)]);
+        side.context = openvrx_format::host_context();
+        let writer = RecordingWriter::create(dir.join("t"), side, WriterOptions::default()).unwrap();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (bytes, polls) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let t = std::thread::spawn(move || recorder_loop(writer, rx, bytes, polls));
+        let v = VideoSettings { preset: VideoPreset::Quality, ..VideoSettings::default() };
+        tx.send(RecMsg::Event(app_event(None, "video_settings", video_json(&v)))).unwrap();
+        tx.send(RecMsg::Event(app_event(Some(0), "rx_stats", serde_json::json!({"gain": 64})))).unwrap();
+        tx.send(RecMsg::Context("summary".into(), serde_json::json!({"duration_s": 1.5}))).unwrap();
+        drop(tx);
+        let side = t.join().unwrap().unwrap();
+        assert_eq!(side.context["summary"]["duration_s"], 1.5);
+        assert!(side.context.contains_key("build"));
+        let rec = openvrx_format::Recording::open(dir.join("t.openvrx.json")).unwrap();
+        assert_eq!(rec.sidecar().context["summary"]["duration_s"], 1.5, "the summary reaches the file");
+        let text = std::fs::read_to_string(dir.join("t.events.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines[0]["kind"], "video_settings");
+        assert_eq!(lines[0]["picture_mode"], "quality");
+        assert_eq!(lines[0]["video"]["preset"], "quality");
+        assert_eq!(lines[0]["file_bytes"], serde_json::json!([0]));
+        assert_eq!(lines[1]["kind"], "rx_stats");
+        assert_eq!(lines[1]["rx"], 0);
+        assert_eq!(lines[1]["byte"], 0);
+        assert_eq!(lines[1]["gain"], 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn video_mapping() {
         let mut v = VideoSettings {
             preset: VideoPreset::Quality,
             standard: StandardChoice::Auto,
             diversity: DiversityMode::Select,
-            cleanup: true,
             steady_osd: false,
             ..VideoSettings::default()
         };
@@ -1717,7 +1941,7 @@ mod tests {
             e.emit_frames = false;
             e
         });
-        v.cleanup = false;
+        v.preset = VideoPreset::Raw;
         let raw = video_config(&v, VideoStandard::Ntsc);
         assert!(!raw.repair_enabled);
         v.steady_osd = true;

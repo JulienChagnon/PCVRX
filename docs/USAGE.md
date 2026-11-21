@@ -37,8 +37,9 @@ its own power with the settings it saved, so tell the app what those are:
 | F1 | help |
 | Tab | open/close the side panels (the menu: receivers, video, display, recording) |
 | O | OSD on/off |
-| Space | cleanup on/off (raw picture) |
+| Left / Right | previous / next picture mode |
 | R | start/stop recording |
+| M | start/stop video recording (MP4 of view 1, needs ffmpeg) |
 | H | HD3 mode |
 | V | 1, 2 or 4 views |
 | A | aspect (fit, fill, stretch) |
@@ -56,14 +57,15 @@ its own power with the settings it saved, so tell the app what those are:
 The side panels (Tab) are the menu. In FX2-only mode the channel and gain
 controls there do nothing; change them on the C5 (below).
 
-Video presets (Tab, video): `raw` (demodulation, sync and bob only),
-`low_latency` (the default: comb filter, repair, edge-directed
-deinterlace), `balanced` (plus a light temporal denoise), `quality` (3D comb,
-motion-compensated denoise) and `learned`: the raw picture through a
-learned denoise filter on the GPU. It reads only the current and the two
-previous fields, so it
-adds no delay; the app picks the filter that matches the steady OSD setting
-(I). Space still switches all cleanup off.
+Picture modes (the arrow keys, Esc menu or Tab, video): `raw` (demodulation,
+sync and bob only), `low_latency` (the default: comb filter, repair,
+edge-directed deinterlace), `balanced` (plus a light temporal denoise),
+`quality` (3D comb, motion-compensated denoise), `learned` (the raw picture
+through a learned denoise filter on the GPU) and `plugin` (a filter plugin
+library, `--plugin`). The learned filter reads only the current and the two
+previous fields, so it adds no delay; the app picks the filter that matches
+the steady OSD setting (I). The arrow keys step through the list and wrap
+around, so raw is one key away from low latency and from plugin.
 
 ## The C5 radio head (`tools/c5cmd.py`, `tools/flash.py`)
 

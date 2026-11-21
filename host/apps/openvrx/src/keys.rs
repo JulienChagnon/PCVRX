@@ -11,7 +11,6 @@ pub enum Action {
     Osd,
     Record,
     RecordVideo,
-    Cleanup,
     Preset,
     PresetPrev,
     SteadyOsd,
@@ -36,12 +35,11 @@ pub const BINDINGS: &[(Key, bool, Action, &str)] = &[
     (Key::F1, false, Action::Help, "Show or hide this help"),
     (Key::F11, false, Action::Fullscreen, "Fullscreen on the window's monitor"),
     (Key::Tab, false, Action::Panels, "Show or hide the control panels"),
-    (Key::O, false, Action::Osd, "OSD on/off (C/N bars stay while cleanup is on)"),
+    (Key::O, false, Action::Osd, "OSD on/off (C/N bars stay in every picture mode but raw)"),
     (Key::R, false, Action::Record, "Start or stop raw recording"),
     (Key::M, false, Action::RecordVideo, "Start or stop video recording (decoded picture of view 1, MP4; needs ffmpeg)"),
-    (Key::Space, false, Action::Cleanup, "Cleanup on/off (raw view)"),
-    (Key::ArrowRight, false, Action::Preset, "Next video preset: raw / low latency / balanced / quality / learned / plugin"),
-    (Key::ArrowLeft, false, Action::PresetPrev, "Previous video preset"),
+    (Key::ArrowRight, false, Action::Preset, "Next picture mode: raw / low latency / balanced / quality / learned / plugin"),
+    (Key::ArrowLeft, false, Action::PresetPrev, "Previous picture mode"),
     (Key::I, false, Action::SteadyOsd, "Steady OSD: fields line-doubled like goggles (off: true interlace rows)"),
     (Key::H, false, Action::Hd3, "HD3 goggle mode (5:3 output, goggle-safe OSD)"),
     (Key::V, false, Action::Layout, "1 / 2 / 4 views"),
@@ -92,7 +90,8 @@ mod tests {
 
     #[test]
     fn lookup() {
-        assert_eq!(action_for(Key::Space, false), Some(Action::Cleanup));
+        assert_eq!(action_for(Key::ArrowRight, false), Some(Action::Preset));
+        assert_eq!(action_for(Key::Space, false), None);
         assert_eq!(action_for(Key::Q, true), Some(Action::Quit));
         assert_eq!(action_for(Key::Q, false), None);
         assert_eq!(key_name(Key::Q, true), "Ctrl+Q");

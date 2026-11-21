@@ -547,8 +547,6 @@ pub struct VideoSettings {
     pub preset: VideoPreset,
     pub standard: StandardChoice,
     pub diversity: DiversityMode,
-    /// Master cleanup switch (Space). Off = raw view whatever the preset.
-    pub cleanup: bool,
     /// Steady OSD (I): every field on the same rows, as goggles show it.
     /// The flight controller OSD stops jumping a row per field; the camera
     /// picture loses its half-line placement.
@@ -568,7 +566,6 @@ impl Default for VideoSettings {
             preset: VideoPreset::LowLatency,
             standard: StandardChoice::Auto,
             diversity: DiversityMode::Blend,
-            cleanup: true,
             steady_osd: true,
             plugin_path: None,
             plugin_config: serde_json::Value::Null,
@@ -594,26 +591,17 @@ impl VideoSettings {
     /// The plugin to run: (library, config) while the `plugin` preset is in
     /// effect and a library is set.
     pub fn plugin(&self) -> Option<(&Path, String)> {
-        if !self.effective_preset().uses_plugin() {
+        if !self.preset.uses_plugin() {
             return None;
         }
         let p = self.plugin_path.as_deref().filter(|p| !p.as_os_str().is_empty())?;
         Some((p, self.plugin_config_text()))
     }
 
-    /// The preset actually running (Raw when cleanup is switched off).
-    pub fn effective_preset(&self) -> VideoPreset {
-        if self.cleanup {
-            self.preset
-        } else {
-            VideoPreset::Raw
-        }
-    }
-
     /// True when picture cleanup is active (safety rule: the C/N bars
-    /// must then stay visible).
+    /// must then stay visible). Raw is the only picture mode without it.
     pub fn cleanup_active(&self) -> bool {
-        self.effective_preset() != VideoPreset::Raw
+        self.preset != VideoPreset::Raw
     }
 }
 
@@ -1233,19 +1221,21 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_switch() {
+    fn raw_is_a_picture_mode() {
         let mut v = VideoSettings {
             preset: VideoPreset::Quality,
             ..VideoSettings::default()
         };
         assert!(v.cleanup_active());
-        assert_eq!(v.effective_preset(), VideoPreset::Quality);
-        v.cleanup = false;
-        assert!(!v.cleanup_active());
-        assert_eq!(v.effective_preset(), VideoPreset::Raw);
-        v.cleanup = true;
         v.preset = VideoPreset::Raw;
         assert!(!v.cleanup_active());
+        // Raw sits between plugin and low latency on the arrow keys.
+        assert_eq!(VideoPreset::Raw.prev(), VideoPreset::Plugin);
+        assert_eq!(VideoPreset::Raw.next(), VideoPreset::LowLatency);
+        // Files saved with the old master switch still load; the mode they
+        // name is the one shown.
+        let old = AppSettings::from_json(r#"{"video": {"preset": "quality", "cleanup": false}}"#).unwrap();
+        assert_eq!(old.video.preset, VideoPreset::Quality);
         for p in VideoPreset::ALL {
             let cfg = openvrx_video::VideoConfig::preset(p.pipeline_name(), VideoStandard::Ntsc);
             assert!(cfg.is_some(), "{}", p.name());
@@ -1264,12 +1254,12 @@ mod tests {
         assert_eq!(v.plugin().unwrap().1, r#"{"model_dir":"/m","threads":2}"#);
         v.plugin_config = serde_json::Value::String("gain=0.5".into());
         assert_eq!(v.plugin_config_text(), "gain=0.5");
-        v.cleanup = false;
-        assert!(v.plugin().is_none(), "cleanup off is raw");
+        v.preset = VideoPreset::Raw;
+        assert!(v.plugin().is_none(), "raw runs no plugin");
+        v.preset = VideoPreset::Plugin;
         // Saved and loaded with the rest; the deadline is clamped.
         let mut s = AppSettings::default();
         s.video = v;
-        s.video.cleanup = true;
         s.video.plugin_deadline_ms = 500.0;
         let back = AppSettings::from_json(&s.to_json()).unwrap();
         assert_eq!(back.video.plugin_path, s.video.plugin_path);

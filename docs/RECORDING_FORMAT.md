@@ -73,6 +73,22 @@ settings (C/N, fading, deviation, standard, seeds, picture source) plus:
 `delay_samples` is the group delay the simulator's channel adds, so a
 decoder output at input sample `n` compares with `truth[n - delay]`.
 
+### Context (optional)
+
+`context` holds what the recording program knew besides the signal. Nothing
+in it is needed to decode, its keys are free form (each program owns its
+own) and it is left out when empty. Readers must not depend on it.
+
+| key | written by | content |
+|---|---|---|
+| `build` | app, CLI | `software`, `commit` (short hash of HEAD at build time), `profile`, `exe`, `exe_modified_utc` |
+| `host` | app, CLI | `os`, `arch`, `cpus`, `name`; on Linux also `kernel`, `cpu`, `cpu_governor`, `mem_total_mb`, and the load at the start (`load_1m`, `load_5m`, `mem_available_mb`) |
+| `command_line` | app, CLI | the program's arguments |
+| `output` | app, CLI | `folder` and its file system (`fs`, Linux: `ntfs3`, `fuseblk`, `btrfs`...) |
+| `app` | app | `picture_mode` and every video setting (`video`) at the start; per receiver its settings, description, C5 `ver` reply and whether the host runs the gain loop; the open views |
+| `start` | app | each receiver's state when recording started: decoder statistics (`stats`), USB stream counters (`stream`), lines the DSP thread dropped, gain |
+| `summary` | app | written at close: `ended_utc`, `duration_s`, `bytes`, `rec_queue_dropped_blocks` (disk too slow), `fifo_full_polls` and `fifo_lost_ms_est`, the picture mode and video settings at the end (`end`), views, host load, each receiver's state |
+
 ## Events (`NAME.events.jsonl`)
 
 Every event has `rx` (or null for session-wide), `host_ns`, `kind`, and
@@ -93,6 +109,12 @@ data).
 | `transfer` | `bytes` (every 64th bulk completion: timing for latency analysis) |
 | `marker` | `text` (user marker key) |
 | `c5` | `line` (raw console line) |
+| `fifo_full` | `polls` (the FX2 found its FIFO full this many times since its last report, about 0.83 us of samples each) |
+| `video_settings` | `picture_mode`, `video` (every video setting), `file_bytes` (each receiver's file size then, in rx order); app, on every change |
+| `rx_stats` | `stats`, `stream`, `dsp_lines_dropped`, `gain`, `connected` (as in `context.start`); app, once a second per receiver, `byte` = that receiver's file size then |
+| `app_stats` | `host` (load, free memory), `rec_queue_dropped`, `views` (lost lines, pipeline rebuilds, filter state); app, once a second |
+
+Floating-point statistics that have no value yet (NaN) are written as null.
 
 ## Rolling buffer
 

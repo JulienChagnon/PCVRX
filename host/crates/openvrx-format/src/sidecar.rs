@@ -31,6 +31,12 @@ pub struct Sidecar {
     pub standard_hint: Option<VideoStandard>,
     #[serde(default)]
     pub sim: Option<SimInfo>,
+    /// What the recording program knew besides the signal, for debugging
+    /// (never needed to decode): host, build, command line, the app's
+    /// settings and picture mode at the start, a summary at the end. Free
+    /// form, so each program owns its keys; see [`crate::host_context`].
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub context: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One receiver's stream.
@@ -150,6 +156,7 @@ impl Sidecar {
             receivers,
             standard_hint: None,
             sim: None,
+            context: serde_json::Map::new(),
         }
     }
 
@@ -278,6 +285,22 @@ mod tests {
         // Round trip through our own serializer.
         let back: Sidecar = serde_json::from_str(&s.to_json_pretty()).unwrap();
         assert_eq!(back, s);
+        assert!(s.context.is_empty());
+        assert!(!s.to_json_pretty().contains("\"context\""), "an empty context is not written");
+    }
+
+    #[test]
+    fn context_round_trip() {
+        let mut s = Sidecar::new(
+            RecordingSource::Hardware,
+            vec![ReceiverInfo::new(0, SampleFormat::from_preset(LanePreset::I6Q6, 15))],
+        );
+        s.context = crate::host_context();
+        s.context.insert("app".into(), serde_json::json!({"picture_mode": "quality"}));
+        let back: Sidecar = serde_json::from_str(&s.to_json_pretty()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.context["app"]["picture_mode"], "quality");
+        assert!(back.context["build"]["software"].as_str().unwrap().starts_with("openvrx "));
     }
 
     #[test]

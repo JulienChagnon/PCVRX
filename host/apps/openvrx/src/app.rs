@@ -169,7 +169,7 @@ impl OpenvrxApp {
     /// setting (the field geometry it was fitted on) and switches the field
     /// history and the GPU pass on for the shown views, off otherwise.
     fn apply_live_filter(&mut self) {
-        let on = self.settings.video.effective_preset().gpu_filter();
+        let on = self.settings.video.preset.gpu_filter();
         let steady = self.settings.video.steady_osd;
         if self.live_filter_applied != Some((on, steady)) {
             let text = if steady {
@@ -264,6 +264,15 @@ impl OpenvrxApp {
                     self.backend.send(AppCommand::StopVideoRecording);
                     bench_out("OK vstop");
                 }
+                // Picture mode by its saved name (raw, low_latency, ...).
+                "mode" => match crate::settings::VideoPreset::ALL.iter().find(|p| p.name() == arg) {
+                    Some(&p) => {
+                        let cur = self.settings.video.preset;
+                        self.set_preset(p, p.index() as i32 - cur.index() as i32);
+                        bench_out(&format!("OK mode {}", p.name()));
+                    }
+                    None => bench_out(&format!("ERR mode {arg}: unknown picture mode")),
+                },
                 "compare" => {
                     self.toggle_compare();
                     bench_out("OK compare");
@@ -299,7 +308,7 @@ impl OpenvrxApp {
         self.backend.send(cmd);
     }
 
-    /// Selects a video preset and starts the switch overlay; `steps` gives
+    /// Selects a picture mode and starts the switch overlay; `steps` gives
     /// the direction it slides from (arrow keys: +-1; menu: the index jump).
     pub fn set_preset(&mut self, p: crate::settings::VideoPreset, steps: i32) {
         if steps == 0 || p == self.settings.video.preset {
@@ -312,9 +321,7 @@ impl OpenvrxApp {
     /// What the switch overlay adds under the description, if anything.
     fn preset_note(&self) -> Option<&'static str> {
         let v = &self.settings.video;
-        if !v.cleanup {
-            Some("cleanup is off (Space): the raw picture shows until it is on")
-        } else if v.preset == crate::settings::VideoPreset::Plugin && v.plugin_path.is_none() {
+        if v.preset == crate::settings::VideoPreset::Plugin && v.plugin_path.is_none() {
             Some("no plugin set (video.plugin_path, or --plugin): the raw pipeline shows")
         } else {
             None
@@ -450,7 +457,6 @@ impl OpenvrxApp {
             Action::Osd => d.osd = !d.osd,
             Action::Record => self.toggle_recording(),
             Action::RecordVideo => self.toggle_video_recording(),
-            Action::Cleanup => self.settings.video.cleanup = !self.settings.video.cleanup,
             Action::Preset => {
                 let p = self.settings.video.preset.next();
                 self.set_preset(p, 1);
@@ -557,8 +563,7 @@ impl OpenvrxApp {
             Action::Osd => RowState::On(d.osd),
             Action::Hd3 => RowState::On(d.hd3_mode),
             Action::Damage => RowState::On(d.damage_overlay),
-            Action::Cleanup => RowState::On(v.cleanup),
-            Action::Preset => RowState::Value(v.preset.name().to_string()),
+            Action::Preset => RowState::Value(v.preset.title().to_string()),
             Action::SteadyOsd => RowState::On(v.steady_osd),
             Action::Record => RowState::On(recording),
             Action::RecordVideo => RowState::On(video_recording),
@@ -711,7 +716,7 @@ impl OpenvrxApp {
                 &painter,
                 area,
                 &self.backend_status,
-                self.settings.video.cleanup,
+                self.settings.video.cleanup_active(),
                 &msgs,
                 now,
                 goggle,

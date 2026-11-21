@@ -104,7 +104,7 @@ pub struct Args {
     #[arg(long, value_name = "MHZ", value_parser = clap::value_parser!(u32).range(5000..=6100))]
     pub mhz: Option<u32>,
     /// Filter plugin library (openvrx-filter ABI): selects the `plugin`
-    /// video preset with cleanup on and saves the path (video.plugin_path).
+    /// picture mode and saves the path (video.plugin_path).
     #[arg(long, value_name = "LIBRARY")]
     pub plugin: Option<PathBuf>,
     /// Text for the plugin's create(), usually JSON (video.plugin_config).
@@ -159,7 +159,6 @@ impl Args {
         if let Some(p) = &self.plugin {
             s.video.plugin_path = Some(p.clone());
             s.video.preset = VideoPreset::Plugin;
-            s.video.cleanup = true;
         }
         if let Some(c) = &self.plugin_config {
             s.video.plugin_config = serde_json::Value::String(c.clone());
@@ -257,7 +256,7 @@ mod tests {
             "9",
         ])
         .unwrap();
-        s.video.cleanup = false;
+        s.video.preset = VideoPreset::Raw;
         p.apply(&mut s);
         assert_eq!(s.video.plugin().unwrap(), (std::path::Path::new("/opt/f/libf.so"), r#"{"threads":2}"#.to_string()));
         assert_eq!(s.video.plugin_deadline_ms, 9.0);

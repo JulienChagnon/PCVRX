@@ -169,10 +169,9 @@ fn receivers(ui: &mut Ui, app: &mut OpenvrxApp) {
 fn video(ui: &mut Ui, app: &mut OpenvrxApp) {
     let v = &mut app.settings.video;
     ui.horizontal(|ui| {
-        ui.label("Preset");
-        combo(ui, "preset", &mut v.preset, &VideoPreset::ALL, |p| p.name().to_string());
+        ui.label("Picture mode");
+        combo(ui, "preset", &mut v.preset, &VideoPreset::ALL, |p| p.title().to_string());
     });
-    ui.checkbox(&mut v.cleanup, "Cleanup (Space: off = raw view)");
     ui.checkbox(&mut v.steady_osd, "Steady OSD (I: fields line-doubled like goggles)");
     ui.horizontal(|ui| {
         ui.label("Standard");

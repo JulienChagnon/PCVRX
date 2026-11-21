@@ -22,6 +22,7 @@
 //! - [`tools`]: listing, summaries, and cutting a time range into a new
 //!   recording.
 
+pub mod context;
 pub mod events;
 pub mod paths;
 pub mod reader;
@@ -31,6 +32,7 @@ pub mod sidecar;
 pub mod tools;
 pub mod writer;
 
+pub use context::{fs_type, host_context, host_load, BUILD_COMMIT};
 pub use events::{Event, EventKind, EventLog, ProbeVerdict};
 pub use paths::RecordingPaths;
 pub use reader::{RawBlocks, RawReader, Recording, Timeline, TruthReader};

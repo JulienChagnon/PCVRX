@@ -25,7 +25,6 @@ const GROUPS: &[(&str, &[Action])] = &[
     (
         "Picture",
         &[
-            Action::Cleanup,
             Action::SteadyOsd,
             Action::Damage,
             Action::Compare,
@@ -56,9 +55,8 @@ fn label(a: Action) -> &'static str {
         Action::Osd => "OSD",
         Action::Record => "Record raw",
         Action::RecordVideo => "Record video (MP4)",
-        Action::Cleanup => "Cleanup",
-        Action::Preset => "Next video preset",
-        Action::PresetPrev => "Previous video preset",
+        Action::Preset => "Next picture mode",
+        Action::PresetPrev => "Previous picture mode",
         Action::SteadyOsd => "Steady OSD",
         Action::Hd3 => "HD3 goggle mode",
         Action::Layout => "Views 1 / 2 / 4",
