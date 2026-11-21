@@ -65,9 +65,11 @@ static const bool ACTIVE_LOW = true;
 static const int QUARTERS_MAX = 127;  // 31.75 dB in 0.25 dB units
 
 // 60/80 ms worked for weeks, then one sweep's presses were all missed by the AW8637 (it stayed at
-// 0 dB while the count went up); 400/600 ms worked. 150/150 is a margin over 60 at 0.3 s per click.
-static int press_ms = 150;
-static int gap_ms = 150;
+// 0 dB while the count went up); 400/600 ms worked. 150/150 then served until it too missed every
+// press of a sweep, and so did 400 ms. 800 ms gives exactly one step; held 2 s the AW8637 repeats
+// (5 steps). 800/600 since (1.4 s per click).
+static int press_ms = 800;
+static int gap_ms = 600;
 static int unit = 1;        // attenuator step size in 0.25 dB units (1, 2, 4, 40)
 static int position = -1;   // in 0.25 dB units, -1 = unknown until "home" or "at"
 

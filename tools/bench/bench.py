@@ -68,6 +68,11 @@ EXE = ".exe" if platform.system() == "Windows" else ""
 DEFAULT_CLI = os.path.join(ROOT, "host", "target", "main", "release", "openvrx-cli" + EXE)
 DEFAULT_APP = os.path.join(ROOT, "host", "target", "main", "release", "openvrx" + EXE)
 
+# Attenuator press and gap (ms), sent to att_ctl at the start of every run:
+# the AW8637 has missed every press of a sweep at 60, 150 and 400 ms, and
+# repeats when held about 2 s; 800 ms gives one step.
+PRESS_MS, GAP_MS = 800, 600
+
 # Picture counts as lost below this share of the reference's frames, or this
 # many dB of PSNR below the reference's own frame-to-mean PSNR.
 MIN_FRAME_SHARE = 0.5
@@ -164,6 +169,9 @@ class Esp32Attenuator:
         self.plus_only = plus_only
         if plus_only:
             print("  attenuator: + relay only, lower values are set by hand when asked")
+        # Press timing every run: an ESP32 that rebooted (or runs an older
+        # att_ctl) falls back to shorter presses the AW8637 has missed.
+        command(self.s, f"timing {PRESS_MS} {GAP_MS}", "timing", 2.0)
         if at is None and plus_only:
             at = 0.0
             input("\n  Set the step attenuator to 0 dB by hand (hold -), then press Enter... ")

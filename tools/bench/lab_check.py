@@ -166,9 +166,9 @@ def main():
         if "video=on" in r.get("vget", ""):
             warn.append("ESP32 video output is ON: make sure it is not wired to the VTX pad while the converter feeds it")
         pm = re.search(r"press_ms=(\d+)", r.get("timing", ""))
-        if pm and int(pm.group(1)) < 150:
-            warn.append(f"attenuator presses are {pm.group(1)} ms: the AW8637 once missed every 60 ms press "
-                        "(sweep stuck at 0 dB); 'timing 150 150' or flash the current att_ctl")
+        if pm and int(pm.group(1)) < 800:
+            warn.append(f"attenuator presses are {pm.group(1)} ms: the AW8637 has missed every press of a sweep "
+                        "at 60, 150 and 400 ms (stuck at 0 dB); 'timing 800 600' or flash the current att_ctl")
     except Exception as e:
         report["esp32"] = {"error": str(e)}
         warn.append(f"ESP32 not reachable at {a.esp32}: {e}")
