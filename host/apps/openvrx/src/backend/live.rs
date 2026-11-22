@@ -37,9 +37,11 @@ use openvrx_hw::c5::{find_c5_ports, C5Client, C5Event, C5Settings, ClientConfig,
 use openvrx_hw::control::{GainConfig, GainLoop, GainTable};
 use openvrx_hw::fx2::{self, list_fx2, Fx2Found, Fx2Kind, Fx2Selector, StreamStats};
 use openvrx_hw::receiver::{auto_pair, LivePairIo, Receiver, ReceiverConfig, ReceiverEvent};
-use openvrx_video::{CombineMode, DeinterlaceMethod, VideoConfig, VideoPipeline};
+use openvrx_video::{
+    CombineMode, DeinterlaceMethod, NtscSeparation, PalSeparation, TemporalMode, VideoConfig, VideoPipeline,
+};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use crossbeam_channel::{RecvTimeoutError, TrySendError};
 use std::sync::mpsc::{self, Receiver as MpscReceiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,13 @@ const LINE_QUEUE: usize = 2048;
 /// Queued lines beyond which the video thread drops its backlog and
 /// restarts at the next field (about 65 ms behind, see `video_loop`).
 const LINE_BACKLOG: usize = LINE_QUEUE / 2;
+/// Queued lines at which a view sheds its costly stages (`Shed`), well
+/// before the backlog that drops lines.
+const SHED_BACKLOG: usize = LINE_BACKLOG / 4;
+/// How long a shed view runs light before trying its full configuration
+/// again; doubled (up to the cap) each time that try overloads at once.
+const SHED_RETRY_NS: u64 = 20_000_000_000;
+const SHED_RETRY_MAX_NS: u64 = 320_000_000_000;
 /// Raw blocks buffered toward the recorder.
 const REC_QUEUE: usize = 1024;
 /// Minimum agreement for pairing a C5 with an FX2 by self-test pattern.
@@ -432,6 +441,111 @@ struct VideoHealth {
     breaks: AtomicU64,
     /// The filter plugin's state for the OSD (plugin preset), else None.
     filter: Mutex<Option<FilterReport>>,
+    /// Shedding level (`Shed`): above 0 the view runs a lighter
+    /// configuration than its picture mode asks for, because the PC could
+    /// not keep up.
+    shed_level: AtomicU8,
+    /// Times the view shed since it opened.
+    sheds: AtomicU64,
+}
+
+/// Deepest shedding level.
+const SHED_MAX_LEVEL: u8 = 2;
+/// Time at one shedding level before a still backed-up queue sheds more.
+const SHED_SETTLE_NS: u64 = 1_000_000_000;
+
+/// The configuration a view runs at shedding `level` when its video thread
+/// cannot keep up. Level 1: the motion-compensated denoise becomes the
+/// recursive one and a 3D comb or transform the 2D comb. Level 2: no
+/// temporal denoise at all (low latency's cost). None when that level
+/// changes nothing for this configuration.
+fn shed_config(cfg: &VideoConfig, level: u8) -> Option<VideoConfig> {
+    let mut c = cfg.clone();
+    if level >= 1 {
+        if c.denoise.temporal == TemporalMode::MotionCompensated {
+            c.denoise.temporal = TemporalMode::Recursive;
+        }
+        if c.color.ntsc == NtscSeparation::Comb3D {
+            c.color.ntsc = NtscSeparation::Comb2D;
+        }
+        if matches!(c.color.pal, PalSeparation::Comb3D | PalSeparation::Transform2D | PalSeparation::Transform3D) {
+            c.color.pal = PalSeparation::Comb2D;
+        }
+    }
+    if level >= 2 {
+        c.denoise.temporal = TemporalMode::Off;
+    }
+    (c != *cfg).then_some(c)
+}
+
+/// Load shedding for one view. A picture mode heavier than the PC can run
+/// in real time used to fall behind until the whole line backlog was
+/// dropped, which shows as black bars or black fields. Instead, once the
+/// queue starts to back up the view goes one level lighter (`shed_config`)
+/// at the next field end, and a level further if the queue still backs up
+/// after `SHED_SETTLE_NS`. After a while it steps back up one level; a step
+/// that overloads again at once doubles the wait.
+#[derive(Default)]
+struct Shed {
+    level: u8,
+    /// The queue backed up: shed at the next field end.
+    pending: bool,
+    since_ns: u64,
+    wait_ns: u64,
+    restored_ns: u64,
+}
+
+impl Shed {
+    /// The configuration to run for the picture mode's `full` one.
+    fn apply(&self, full: VideoConfig) -> VideoConfig {
+        if self.level > 0 {
+            shed_config(&full, self.level).unwrap_or(full)
+        } else {
+            full
+        }
+    }
+
+    /// The line queue is past `SHED_BACKLOG`.
+    fn backing_up(&mut self) {
+        self.pending = true;
+    }
+
+    /// At a field end: Some(level) when the level changes (go lighter or
+    /// try one step heavier again), None to keep things as they are.
+    fn field_end(&mut self, full: &VideoConfig, now: u64) -> Option<u8> {
+        // Levels that change nothing for this configuration are skipped.
+        let cur = shed_config(full, self.level);
+        if std::mem::take(&mut self.pending) {
+            let settled = self.level == 0 || now.saturating_sub(self.since_ns) >= SHED_SETTLE_NS;
+            let next = (self.level + 1..=SHED_MAX_LEVEL).find(|&l| shed_config(full, l) != cur);
+            let Some(next) = next.filter(|_| settled) else {
+                return None;
+            };
+            // A step back up that overloaded at once: wait twice as long.
+            let quick_relapse = self.restored_ns != 0 && now.saturating_sub(self.restored_ns) < SHED_RETRY_NS;
+            if quick_relapse {
+                self.wait_ns = (self.wait_ns * 2).clamp(SHED_RETRY_NS, SHED_RETRY_MAX_NS);
+            } else if self.level == 0 {
+                self.wait_ns = SHED_RETRY_NS;
+            }
+            self.level = next;
+            self.since_ns = now;
+            return Some(next);
+        }
+        if self.level > 0 && now.saturating_sub(self.since_ns) >= self.wait_ns {
+            // One configuration heavier, at the lowest level that gives it
+            // (level 0 when that is the full picture mode).
+            let mut l = (0..self.level).rev().find(|&l| shed_config(full, l) != cur).unwrap_or(0);
+            while l > 0 && shed_config(full, l - 1) == shed_config(full, l) {
+                l -= 1;
+            }
+            self.level = l;
+            self.since_ns = now;
+            self.restored_ns = now;
+            return Some(self.level);
+        }
+        None
+    }
 }
 
 /// Tells the views fed by `rx` that their picture history breaks here.
@@ -605,6 +719,7 @@ fn video_loop(
     let mut current = settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut pipe: Option<(VideoStandard, VideoPipeline)> = None;
     let mut check = HealthCheck::new();
+    let mut shed = Shed::default();
     let (mut catchups, mut catchup_logged_ns) = (0u64, 0u64);
     let mut plugin: Option<ViewPlugin> = None;
     ViewPlugin::sync(&mut plugin, &current);
@@ -641,7 +756,11 @@ fn video_loop(
             }
             pipe = None;
             mark_break(&mut plugin);
+            shed.backing_up();
             continue;
+        }
+        if lines.len() > SHED_BACKLOG {
+            shed.backing_up();
         }
         let line = match lines.recv_timeout(Duration::from_millis(100)) {
             Ok(l) => l,
@@ -659,6 +778,9 @@ fn video_loop(
         if changed {
             ViewPlugin::sync(&mut plugin, &current);
             mark_break(&mut plugin);
+            // A new picture mode gets a fresh try at its full configuration.
+            shed = Shed::default();
+            health.shed_level.store(0, Ordering::Relaxed);
             let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
             if let Some((std, p)) = pipe.as_mut() {
                 p.set_config(&video_config_with(&current, *std, info.as_deref()));
@@ -671,7 +793,8 @@ fn video_loop(
         }
         let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
         if pipe.as_ref().is_none_or(|(s, _)| *s != standard) {
-            pipe = Some((standard, VideoPipeline::new(&video_config_with(&current, standard, info.as_deref()))));
+            let cfg = shed.apply(video_config_with(&current, standard, info.as_deref()));
+            pipe = Some((standard, VideoPipeline::new(&cfg)));
             check = HealthCheck::new();
             mark_break(&mut plugin);
         }
@@ -737,15 +860,30 @@ fn video_loop(
                 // makes what the plugin asked for.
                 let info = vp.applied.clone();
                 vp.filter.mark_break();
-                p.set_config(&video_config_with(&current, standard, info.as_deref()));
+                p.set_config(&shed.apply(video_config_with(&current, standard, info.as_deref())));
             }
             *health.filter.lock().unwrap_or_else(|e| e.into_inner()) = plugin_report(&plugin, &current);
+        }
+        let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
+        let full = video_config_with(&current, standard, info.as_deref());
+        let before = health.shed_level.load(Ordering::Relaxed);
+        if let Some(level) = shed.field_end(&full, now_ns()) {
+            p.set_config(&shed.apply(full.clone()));
+            health.shed_level.store(level, Ordering::Relaxed);
+            if level > before {
+                health.sheds.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "openvrx: video thread falling behind ({} lines queued): lighter picture (level {level}) \
+                     for {} s, then one step back up",
+                    lines.len(),
+                    shed.wait_ns / 1_000_000_000
+                );
+            }
         }
         if check.field_done(p, &health) {
             // The display keeps its texture; the new pipeline rewrites
             // every row as its lines arrive.
-            let info = plugin.as_ref().and_then(|vp| vp.applied.clone());
-            *p = VideoPipeline::new(&video_config_with(&current, standard, info.as_deref()));
+            *p = VideoPipeline::new(&shed.apply(full));
             mark_break(&mut plugin);
         }
     }
@@ -831,6 +969,8 @@ fn views_json(st: &State) -> serde_json::Value {
                 "lost_lines": v.health.lost_lines.load(Ordering::Relaxed),
                 "rebuilds": v.health.rebuilds.load(Ordering::Relaxed),
                 "filter": filter,
+                "shed_level": v.health.shed_level.load(Ordering::Relaxed),
+                "sheds": v.health.sheds.load(Ordering::Relaxed),
             })
         })
         .collect();
@@ -1811,6 +1951,10 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
         }
         let filter = view.health.filter.lock().unwrap_or_else(|e| e.into_inner()).clone();
         view_warnings.extend(filter.as_ref().and_then(|f| f.warning()));
+        let shed = view.health.shed_level.load(Ordering::Relaxed) > 0;
+        if shed {
+            view_warnings.push(format!("PC too slow for {}: lighter picture for now", preset.title()));
+        }
         view.status.publish(|s| {
             s.dropped_lines = lost;
             s.filter = filter.as_ref().map(|f| f.osd_line()).unwrap_or_default();
@@ -1820,7 +1964,7 @@ fn publish_status(ctx: &BackendContext, st: &mut State) {
             s.lock = lock;
             s.freq_mhz = freq;
             s.field_rate_hz = best.map_or(0.0, |b| b.field_rate_hz as f32);
-            s.pipeline = preset.name().into();
+            s.pipeline = if shed { format!("{} (reduced)", preset.name()) } else { preset.name().into() };
             s.receivers = mine.iter().map(|p| p.1.clone()).collect();
             s.simulated = false;
         });
@@ -1885,6 +2029,74 @@ mod tests {
         let d = dsp_config(&r, Some(VideoStandard::Pal));
         assert_eq!(d.sample_format.divider, 12);
         assert_eq!(d.standard, Some(VideoStandard::Pal));
+    }
+
+    #[test]
+    fn shedding_lightens_only_the_heavy_stages() {
+        for std in [VideoStandard::Ntsc, VideoStandard::Pal] {
+            let q = VideoConfig::quality(std);
+            let s = shed_config(&q, 1).expect("quality has heavy stages");
+            assert_eq!(s.denoise.temporal, TemporalMode::Recursive);
+            assert_eq!(s.color.ntsc, NtscSeparation::Comb2D);
+            assert_eq!(s.color.pal, PalSeparation::Comb2D);
+            // Everything else as the picture mode asked.
+            assert_eq!(s.deinterlace, q.deinterlace);
+            assert_eq!(s.repair, q.repair);
+            assert_eq!(s.denoise.luma_strength, q.denoise.luma_strength);
+            // Level 2: no temporal denoise at all.
+            assert_eq!(shed_config(&q, 2).unwrap().denoise.temporal, TemporalMode::Off);
+            // Balanced has nothing for level 1, only level 2.
+            let b = VideoConfig::balanced(std);
+            assert!(shed_config(&b, 1).is_none());
+            assert_eq!(shed_config(&b, 2).unwrap().denoise.temporal, TemporalMode::Off);
+            for light in [VideoConfig::raw(std), VideoConfig::low_latency(std)] {
+                for level in 1..=SHED_MAX_LEVEL {
+                    assert!(shed_config(&light, level).is_none(), "{:?}", light.denoise.temporal);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shedding_switches_at_field_ends_and_backs_off() {
+        let q = VideoConfig::quality(VideoStandard::Ntsc);
+        let s = |sec: u64| sec * 1_000_000_000;
+        let mut sh = Shed::default();
+        assert_eq!(sh.field_end(&q, s(1)), None, "nothing queued");
+        sh.backing_up();
+        assert_eq!(sh.field_end(&q, s(2)), Some(1));
+        assert_eq!(sh.apply(q.clone()), shed_config(&q, 1).unwrap());
+        // Still backed up, but too soon to shed more.
+        sh.backing_up();
+        assert_eq!(sh.field_end(&q, s(2) + SHED_SETTLE_NS / 2), None);
+        // Still backed up a second later: one level lighter, then no lower.
+        sh.backing_up();
+        assert_eq!(sh.field_end(&q, s(3) + SHED_SETTLE_NS), Some(2));
+        assert_eq!(sh.apply(q.clone()), shed_config(&q, 2).unwrap());
+        sh.backing_up();
+        assert_eq!(sh.field_end(&q, s(10)), None, "already at the deepest level");
+        // Steps back up one level at a time.
+        let t = s(3) + SHED_SETTLE_NS + SHED_RETRY_NS;
+        assert_eq!(sh.field_end(&q, t), Some(1));
+        assert_eq!(sh.field_end(&q, t + SHED_RETRY_NS), Some(0));
+        assert_eq!(sh.apply(q.clone()), q);
+        // Overloads again at once: the next wait doubles.
+        let t = t + SHED_RETRY_NS + s(1);
+        sh.backing_up();
+        assert_eq!(sh.field_end(&q, t), Some(1));
+        assert_eq!(sh.wait_ns, 2 * SHED_RETRY_NS);
+        assert_eq!(sh.field_end(&q, t + SHED_RETRY_NS), None);
+        assert_eq!(sh.field_end(&q, t + 2 * SHED_RETRY_NS), Some(0));
+        // Balanced skips straight to the level that lightens it, and back.
+        let b = VideoConfig::balanced(VideoStandard::Ntsc);
+        let mut sb = Shed::default();
+        sb.backing_up();
+        assert_eq!(sb.field_end(&b, s(1)), Some(2), "level 1 changes nothing for balanced");
+        assert_eq!(sb.field_end(&b, s(1) + SHED_RETRY_NS), Some(0));
+        // A picture mode with nothing heavy never sheds.
+        let mut light = Shed::default();
+        light.backing_up();
+        assert_eq!(light.field_end(&VideoConfig::low_latency(VideoStandard::Ntsc), s(1)), None);
     }
 
     #[test]
@@ -2042,6 +2254,52 @@ mod tests {
     /// Encoded NTSC fields through the real video thread with the plugin
     /// preset: once the (in-process) test plugin is ready, every field is
     /// published whole, as the plugin wrote it, with its metadata.
+    /// Floods a view's video thread with `fields` NTSC fields as fast as the
+    /// queue takes them; returns the view's health afterwards.
+    fn flood_view(preset: VideoPreset, fields: u64) -> Arc<VideoHealth> {
+        use openvrx_video::encoder::{CompositeEncoder, EncoderConfig};
+        use openvrx_video::testgen::{color_bars, field_info, image_to_field};
+        let std = VideoStandard::Ntsc;
+        let p = std.params();
+        let enc = CompositeEncoder::new(std, EncoderConfig::default());
+        let pic = color_bars(p.active_width(), p.frame_height(), 0.75);
+        let settings = Arc::new(Mutex::new(VideoSettings { preset, ..VideoSettings::default() }));
+        let ex = FrameExchange::new();
+        let (tx, rx) = crossbeam_channel::bounded(LINE_QUEUE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(VideoHealth::default());
+        let thread = {
+            let (producer, stop, health) = (ex.producer(), Arc::clone(&stop), Arc::clone(&health));
+            std::thread::spawn(move || video_loop(rx, settings, producer, stop, health, Arc::default()))
+        };
+        for seq in 0..fields {
+            let (par, fi) = field_info(seq);
+            let f = image_to_field(&pic, std, par, seq);
+            for rec in enc.encode_field(&f, fi, (seq as f64 * 1e9 / p.field_hz) as u64 + 1) {
+                tx.send(rec).unwrap();
+            }
+        }
+        let t0 = std::time::Instant::now();
+        while !tx.is_empty() && t0.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::SeqCst);
+        drop(tx);
+        thread.join().unwrap();
+        health
+    }
+
+    #[test]
+    fn a_view_that_falls_behind_sheds_its_heavy_stages() {
+        // Lines arrive far faster than real time: the queue backs up at once.
+        let q = flood_view(VideoPreset::Quality, 40);
+        assert!(q.sheds.load(Ordering::Relaxed) >= 1, "quality never shed");
+        assert!(q.shed_level.load(Ordering::Relaxed) >= 1, "still light right after the flood");
+        // Low latency has nothing heavy to shed.
+        let l = flood_view(VideoPreset::LowLatency, 40);
+        assert_eq!(l.sheds.load(Ordering::Relaxed), 0);
+    }
+
     fn run_plugin_view(config: serde_json::Value, deadline_ms: f32, fields: u64) -> (Vec<[f32; 8]>, FilterReport) {
         use crate::source::UploadStaging;
         use openvrx_video::encoder::{CompositeEncoder, EncoderConfig};
