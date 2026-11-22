@@ -1392,6 +1392,7 @@ impl BidiDeinterlacer {
                     range_y: 6,
                     lambda: 0.0004,
                     half_pel: true,
+                    good_enough: 0.0,
                 };
                 let (w, l) = (cur.width, cur.lines);
                 let back = motion::estimate(

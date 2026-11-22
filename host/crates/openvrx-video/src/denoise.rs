@@ -112,6 +112,10 @@ pub struct Denoiser {
     sp_done: usize,
     motion: Option<MotionField>,
     motion_rows_done: usize,
+    /// Motion-compensated copy of `prev` (MC mode), rows `0..mc_done` built
+    /// for this frame. Each row is built once and read by three output rows.
+    mc_ref: Option<Frame>,
+    mc_done: usize,
     out_done: usize,
     row_diff: Vec<f32>,
     cut: bool,
@@ -136,6 +140,8 @@ impl Denoiser {
             sp_done: 0,
             motion: None,
             motion_rows_done: 0,
+            mc_ref: None,
+            mc_done: 0,
             out_done: 0,
             row_diff: Vec::new(),
             cut: false,
@@ -196,11 +202,15 @@ impl Denoiser {
             self.prev = None;
         }
         self.motion = if self.cfg.temporal == TemporalMode::MotionCompensated && self.prev.is_some() {
-            Some(MotionField::new(w, h, &mc_params()))
+            Some(MotionField::new(w, h, &mc_params(0.0)))
         } else {
             None
         };
         self.motion_rows_done = 0;
+        self.mc_done = 0;
+        if self.motion.is_some() && !self.mc_ref.as_ref().is_some_and(|f| f.width == w && f.height == h) {
+            self.mc_ref = Some(Frame::new(w, h));
+        }
         // Noise level from the previous frame (line quality records and
         // the flat-region measurement), so that streaming and whole-frame
         // processing see the same value.
@@ -248,7 +258,7 @@ impl Denoiser {
 
         // 2. Motion estimation (MC mode), block rows in order.
         if let (Some(mf), Some(prev)) = (self.motion.as_mut(), self.prev.as_ref()) {
-            let sp_par = mc_params();
+            let sp_par = mc_params(sy);
             while self.motion_rows_done < mf.rows {
                 let br = self.motion_rows_done;
                 let need = ((br + 1) * MC_BLOCK).min(h);
@@ -304,11 +314,33 @@ impl Denoiser {
                 }
                 cut_flags.push(self.cut);
             }
+            // MC: build the compensated reference rows these output rows read
+            // (r - 1 ..= r + 1), each once; the motion rows they need are done.
+            if let (Some(mf), Some(mc)) = (self.motion.as_ref(), self.mc_ref.as_mut()) {
+                let need = (target + 1).min(h);
+                if need > self.mc_done {
+                    let c0 = self.mc_done;
+                    let ys = &mut mc.y[c0 * w..need * w];
+                    let us = &mut mc.u[c0 * w..need * w];
+                    let vs = &mut mc.v[c0 * w..need * w];
+                    let job = |(i, ((y, u), v)): (usize, Rows3Mut)| compensate_row(prev, mf, c0 + i, y, u, v);
+                    if parallel {
+                        ys.par_chunks_mut(w).zip(us.par_chunks_mut(w)).zip(vs.par_chunks_mut(w)).enumerate().for_each(job);
+                    } else {
+                        ys.chunks_mut(w).zip(us.chunks_mut(w)).zip(vs.chunks_mut(w)).enumerate().for_each(job);
+                    }
+                    self.mc_done = need;
+                }
+            }
+            let refp = match (&self.motion, &self.mc_ref) {
+                (Some(_), Some(mc)) => mc,
+                _ => prev,
+            };
             let ctx = TemporalCtx {
                 cfg: &self.cfg,
                 cur: sp,
-                prev,
-                motion: self.motion.as_ref(),
+                refp,
+                prev_damage: &prev.damage,
                 w,
                 h,
                 sy,
@@ -389,7 +421,11 @@ impl Denoiser {
     }
 }
 
-fn mc_params() -> SearchParams {
+/// Search settings for luma noise `sigma_y` (0..1 of the black-white span).
+/// A block matching within about 1.5 sigma is as good as the noise allows
+/// (the mean |difference| of two noisy copies of the same picture is about
+/// 1.1 sigma), so its candidate vector is kept without the grid search.
+fn mc_params(sigma_y: f32) -> SearchParams {
     SearchParams {
         block_w: MC_BLOCK,
         block_h: MC_BLOCK,
@@ -397,6 +433,7 @@ fn mc_params() -> SearchParams {
         range_y: 12,
         lambda: 0.0004,
         half_pel: true,
+        good_enough: 1.5 * sigma_y + 0.004,
     }
 }
 
@@ -584,11 +621,45 @@ fn temporal_kernel(
     }
 }
 
+/// Motion-compensated reference row r of all three planes of `prev`: one
+/// vector per pixel, shared by the planes.
+fn compensate_row(prev: &Frame, mf: &MotionField, r: usize, oy: &mut [f32], ou: &mut [f32], ov: &mut [f32]) {
+    let (w, h) = (prev.width, prev.height);
+    let (py, pu, pv) = (Plane::new(&prev.y, w, h), Plane::new(&prev.u, w, h), Plane::new(&prev.v, w, h));
+    for x in 0..w {
+        let (dx, dy) = mf.at_pixel(x, r);
+        let (sx, sy) = (x as f32 + dx, r as f32 + dy);
+        let (fx, fy) = (sx.floor(), sy.floor());
+        if fx >= 0.0 && fy >= 0.0 && fx + 1.0 < w as f32 && fy + 1.0 < h as f32 {
+            // Inside: the four neighbours without clamping, the same
+            // arithmetic as `Plane::sample`.
+            let (tx, ty) = (sx - fx, sy - fy);
+            let i = fy as usize * w + fx as usize;
+            let bil = |p: &[f32]| {
+                let (a, b, c, d) = (p[i], p[i + 1], p[i + w], p[i + w + 1]);
+                let top = a + (b - a) * tx;
+                let bot = c + (d - c) * tx;
+                top + (bot - top) * ty
+            };
+            oy[x] = bil(&prev.y);
+            ou[x] = bil(&prev.u);
+            ov[x] = bil(&prev.v);
+        } else {
+            oy[x] = py.sample(sx, sy);
+            ou[x] = pu.sample(sx, sy);
+            ov[x] = pv.sample(sx, sy);
+        }
+    }
+}
+
 struct TemporalCtx<'a> {
     cfg: &'a DenoiseConfig,
     cur: &'a Frame,
-    prev: &'a Frame,
-    motion: Option<&'a MotionField>,
+    /// What the current frame is blended with: the previous output, or its
+    /// motion-compensated copy (rows built ahead of the temporal stage).
+    refp: &'a Frame,
+    /// Damage of the previous output (at the uncompensated position).
+    prev_damage: &'a [u8],
     w: usize,
     h: usize,
     sy: f32,
@@ -596,61 +667,28 @@ struct TemporalCtx<'a> {
 }
 
 impl TemporalCtx<'_> {
-    /// Reference row (previous output, motion compensated when enabled)
-    /// of plane `plane` at row r.
+    /// 3x3 mean of (cur - ref) over rows r-1..r+1 for one plane into `out`.
     #[inline(always)]
-    fn reference_row(&self, plane: usize, r: usize, out: &mut [f32]) {
-        let data = match plane {
-            0 => &self.prev.y,
-            1 => &self.prev.u,
-            _ => &self.prev.v,
-        };
+    fn diff_box(&self, plane: usize, rows: [usize; 3], out: &mut [f32]) {
         let w = self.w;
-        match self.motion {
-            Some(mf) => {
-                let pl = Plane::new(data, w, self.h);
-                for (x, o) in out.iter_mut().enumerate() {
-                    let (dx, dy) = mf.at_pixel(x, r);
-                    *o = pl.sample(x as f32 + dx, r as f32 + dy);
-                }
-            }
-            None => out.copy_from_slice(&data[r * w..(r + 1) * w]),
-        }
-    }
-
-    /// 3x3 mean of (cur - ref) over rows r-1..r+1 for one plane into `out`;
-    /// `centre_ref` receives the centre row's reference when motion
-    /// compensated (without motion the reference rows are used in place).
-    #[inline(always)]
-    fn diff_box(&self, plane: usize, rows: [usize; 3], centre_ref: &mut [f32], out: &mut [f32]) {
-        let w = self.w;
-        let (cur, prev) = match plane {
-            0 => (&self.cur.y, &self.prev.y),
-            1 => (&self.cur.u, &self.prev.u),
-            _ => (&self.cur.v, &self.prev.v),
+        let (cur, rf) = match plane {
+            0 => (&self.cur.y, &self.refp.y),
+            1 => (&self.cur.u, &self.refp.u),
+            _ => (&self.cur.v, &self.refp.v),
         };
         fn row(p: &[f32], w: usize, r: usize) -> &[f32] {
             &p[r * w..(r + 1) * w]
         }
         let mut col = scratch_any(w);
-        if self.motion.is_some() {
-            let mut r0 = scratch_any(w);
-            let mut r2 = scratch_any(w);
-            self.reference_row(plane, rows[0], &mut r0);
-            self.reference_row(plane, rows[1], centre_ref);
-            self.reference_row(plane, rows[2], &mut r2);
-            diff3(row(cur, w, rows[0]), &r0, row(cur, w, rows[1]), centre_ref, row(cur, w, rows[2]), &r2, &mut col);
-        } else {
-            diff3(
-                row(cur, w, rows[0]),
-                row(prev, w, rows[0]),
-                row(cur, w, rows[1]),
-                row(prev, w, rows[1]),
-                row(cur, w, rows[2]),
-                row(prev, w, rows[2]),
-                &mut col,
-            );
-        }
+        diff3(
+            row(cur, w, rows[0]),
+            row(rf, w, rows[0]),
+            row(cur, w, rows[1]),
+            row(rf, w, rows[1]),
+            row(cur, w, rows[2]),
+            row(rf, w, rows[2]),
+            &mut col,
+        );
         box3_ninth(&col, out);
     }
 
@@ -676,23 +714,16 @@ impl TemporalCtx<'_> {
     fn row_impl(&self, r: usize, oy: &mut [f32], ou: &mut [f32], ov: &mut [f32]) -> f64 {
         let w = self.w;
         let rows = [r.saturating_sub(1), r, (r + 1).min(self.h - 1)];
-        let mc = self.motion.is_some();
-        let mut ry = scratch_any(if mc { w } else { 0 });
-        let mut ru = scratch_any(if mc { w } else { 0 });
-        let mut rv = scratch_any(if mc { w } else { 0 });
         let mut by = scratch_any(w);
         let mut bu = scratch_any(w);
         let mut bv = scratch_any(w);
-        self.diff_box(0, rows, &mut ry, &mut by);
-        self.diff_box(1, rows, &mut ru, &mut bu);
-        self.diff_box(2, rows, &mut rv, &mut bv);
+        self.diff_box(0, rows, &mut by);
+        self.diff_box(1, rows, &mut bu);
+        self.diff_box(2, rows, &mut bv);
         let base = r * w;
         let span = base..base + w;
-        let (ry, ru, rv): (&[f32], &[f32], &[f32]) = if mc {
-            (&ry, &ru, &rv)
-        } else {
-            (&self.prev.y[span.clone()], &self.prev.u[span.clone()], &self.prev.v[span.clone()])
-        };
+        let (ry, ru, rv): (&[f32], &[f32], &[f32]) =
+            (&self.refp.y[span.clone()], &self.refp.u[span.clone()], &self.refp.v[span.clone()]);
         let f = row_factor(self.cur, r);
         let sy = self.sy * f;
         let sc = self.sc * f;
@@ -713,7 +744,7 @@ impl TemporalCtx<'_> {
             [ry, ru, rv],
             [&by, &bu, &bv],
             &self.cur.damage[span.clone()],
-            &self.prev.damage[span],
+            &self.prev_damage[span],
             oy,
             ou,
             ov,

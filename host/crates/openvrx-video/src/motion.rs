@@ -75,6 +75,11 @@ pub struct SearchParams {
     /// units), favours smooth, short vectors in flat areas.
     pub lambda: f32,
     pub half_pel: bool,
+    /// Mean absolute difference at or below which the best candidate
+    /// (zero, previous or neighbouring vectors) is taken without the grid
+    /// search: a match that good is as close as the noise allows. 0 always
+    /// searches.
+    pub good_enough: f32,
 }
 
 /// A field of block vectors.
@@ -127,8 +132,31 @@ impl MotionField {
     }
 }
 
-/// Mean absolute difference of a block at an integer displacement, with
-/// optional 2:1 subsampling.
+/// Sum of |a - b| over two equal-length rows. Eight partial sums, so the
+/// compiler can keep them in one vector register (a single running f32 sum
+/// cannot be vectorised: float addition is not reassociated).
+#[inline(always)]
+fn sad_row(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut acc = [0.0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        for i in 0..8 {
+            acc[i] += (x[i] - y[i]).abs();
+        }
+    }
+    let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+    for (x, y) in ra.iter().zip(rb) {
+        s += (x - y).abs();
+    }
+    s
+}
+
+/// Mean absolute difference of a block at an integer displacement. `step`
+/// 2 takes every other row (the coarse search; whole rows keep the inner
+/// loop contiguous).
 #[allow(clippy::too_many_arguments)]
 fn sad_int(cur: &Plane, refp: &Plane, bx: usize, by: usize, bw: usize, bh: usize, dx: i32, dy: i32, step: usize) -> f32 {
     let x1 = (bx + bw).min(cur.width);
@@ -143,39 +171,68 @@ fn sad_int(cur: &Plane, refp: &Plane, bx: usize, by: usize, bw: usize, bh: usize
     let mut n = 0usize;
     let mut y = by;
     while y < y1 {
-        let crow = &cur.data[y * cur.width..y * cur.width + cur.width];
+        let crow = &cur.data[y * cur.width + bx..y * cur.width + x1];
         if inside {
             let ry = (y as isize + dy as isize) as usize;
-            let rrow = &refp.data[ry * refp.width..ry * refp.width + refp.width];
-            let mut x = bx;
-            while x < x1 {
-                acc += (crow[x] - rrow[(x as isize + dx as isize) as usize]).abs();
-                n += 1;
-                x += step;
-            }
+            let rs = ry * refp.width + rx0 as usize;
+            acc += sad_row(crow, &refp.data[rs..rs + crow.len()]);
         } else {
-            let mut x = bx;
-            while x < x1 {
-                acc += (crow[x] - refp.at(x as isize + dx as isize, y as isize + dy as isize)).abs();
-                n += 1;
-                x += step;
+            for (i, c) in crow.iter().enumerate() {
+                acc += (c - refp.at((bx + i) as isize + dx as isize, y as isize + dy as isize)).abs();
             }
         }
+        n += crow.len();
         y += step;
     }
     acc / n.max(1) as f32
 }
 
+/// Mean absolute difference at a fractional displacement, bilinear
+/// reference samples. The weights are the same for every sample of the
+/// block, so inside the plane each row is four shifted reference rows.
 #[allow(clippy::too_many_arguments)]
 fn sad_frac(cur: &Plane, refp: &Plane, bx: usize, by: usize, bw: usize, bh: usize, dx: f32, dy: f32) -> f32 {
     let x1 = (bx + bw).min(cur.width);
     let y1 = (by + bh).min(cur.height);
+    let (fx, fy) = (dx.floor(), dy.floor());
+    let (tx, ty) = (dx - fx, dy - fy);
+    let (ix, iy) = (fx as isize, fy as isize);
+    let inside = bx as isize + ix >= 0
+        && by as isize + iy >= 0
+        && x1 as isize + ix < refp.width as isize
+        && y1 as isize + iy < refp.height as isize;
     let mut acc = 0.0f32;
     let mut n = 0usize;
-    for y in by..y1 {
-        for x in bx..x1 {
-            acc += (cur.data[y * cur.width + x] - refp.sample(x as f32 + dx, y as f32 + dy)).abs();
-            n += 1;
+    if inside {
+        let len = x1 - bx;
+        let mut row = [0.0f32; 64];
+        let mut scratch;
+        let tmp: &mut [f32] = if len <= row.len() {
+            &mut row[..len]
+        } else {
+            scratch = vec![0.0f32; len];
+            &mut scratch[..]
+        };
+        for y in by..y1 {
+            let r0 = ((y as isize + iy) as usize) * refp.width + (bx as isize + ix) as usize;
+            let r1 = r0 + refp.width;
+            let (a, b) = (&refp.data[r0..r0 + len], &refp.data[r0 + 1..r0 + 1 + len]);
+            let (c, d) = (&refp.data[r1..r1 + len], &refp.data[r1 + 1..r1 + 1 + len]);
+            // Same arithmetic as `Plane::sample`, so both paths agree exactly.
+            for i in 0..len {
+                let top = a[i] + (b[i] - a[i]) * tx;
+                let bot = c[i] + (d[i] - c[i]) * tx;
+                tmp[i] = top + (bot - top) * ty;
+            }
+            acc += sad_row(&cur.data[y * cur.width + bx..y * cur.width + x1], tmp);
+            n += len;
+        }
+    } else {
+        for y in by..y1 {
+            for x in bx..x1 {
+                acc += (cur.data[y * cur.width + x] - refp.sample(x as f32 + dx, y as f32 + dy)).abs();
+                n += 1;
+            }
         }
     }
     acc / n.max(1) as f32
@@ -189,26 +246,42 @@ fn estimate_block(cur: &Plane, refp: &Plane, sp: &SearchParams, col: usize, row:
     let pen = |dx: f32, dy: f32| sp.lambda * (dx.abs() + dy.abs());
     let cost_int = |dx: i32, dy: i32, step: usize| sad_int(cur, refp, bx, by, bw, bh, dx, dy, step) + pen(dx as f32, dy as f32);
     let clampv = |dx: i32, dy: i32| (dx.clamp(-sp.range_x, sp.range_x), dy.clamp(-sp.range_y, sp.range_y));
+    // Full-resolution costs are remembered per vector: the candidates, the
+    // two refinements and their repeated passes keep landing on vectors
+    // already measured. Every vector here is clamped into the window.
+    let wx = (2 * sp.range_x + 1) as usize;
+    let memo = std::cell::RefCell::new(vec![f32::NAN; wx * (2 * sp.range_y + 1) as usize]);
+    let full = |dx: i32, dy: i32| -> f32 {
+        let i = (dy + sp.range_y) as usize * wx + (dx + sp.range_x) as usize;
+        let mut m = memo.borrow_mut();
+        if m[i].is_nan() {
+            m[i] = cost_int(dx, dy, 1);
+        }
+        m[i]
+    };
     let mut best = (0i32, 0i32);
-    let mut best_cost = cost_int(0, 0, 1);
+    let mut best_cost = full(0, 0);
     for &(cx, cy) in cands {
         let (cx, cy) = clampv(cx, cy);
         if (cx, cy) == (0, 0) {
             continue;
         }
-        let c = cost_int(cx, cy, 1);
+        let c = full(cx, cy);
         if c < best_cost {
             best_cost = c;
             best = (cx, cy);
         }
     }
+    // A candidate that already matches to the noise level only gets a
+    // one-sample refinement; otherwise the coarse grid searches the range.
+    let settled = sp.good_enough > 0.0 && best_cost - pen(best.0 as f32, best.1 as f32) <= sp.good_enough;
     // Coarse grid, subsampled.
     let gx = (sp.range_x / 4).max(1);
     let gy = (sp.range_y / 4).max(1);
     let mut coarse_best = best;
     let mut coarse_cost = f32::INFINITY;
     let mut ty = -sp.range_y;
-    while ty <= sp.range_y {
+    while !settled && ty <= sp.range_y {
         let mut tx = -sp.range_x;
         while tx <= sp.range_x {
             let c = cost_int(tx, ty, 2);
@@ -220,11 +293,16 @@ fn estimate_block(cur: &Plane, refp: &Plane, sp: &SearchParams, col: usize, row:
         }
         ty += gy;
     }
+    let (starts, steps): (&[(i32, i32)], &[i32]) = if settled {
+        (&[best], &[1])
+    } else {
+        (&[best, coarse_best], &[gx.max(gy).max(2) / 2, 1, 1])
+    };
     // Refine around both the candidate winner and the coarse winner.
-    for start in [best, coarse_best] {
+    for &start in starts {
         let mut pos = start;
-        let mut cost = cost_int(pos.0, pos.1, 1);
-        for step in [gx.max(gy).max(2) / 2, 1, 1] {
+        let mut cost = full(pos.0, pos.1);
+        for &step in steps {
             let step = step.max(1);
             loop {
                 let mut improved = false;
@@ -233,7 +311,7 @@ fn estimate_block(cur: &Plane, refp: &Plane, sp: &SearchParams, col: usize, row:
                     if (nx, ny) == pos {
                         continue;
                     }
-                    let c = cost_int(nx, ny, 1);
+                    let c = full(nx, ny);
                     if c < cost {
                         cost = c;
                         pos = (nx, ny);
@@ -332,12 +410,58 @@ mod tests {
             range_y: 8,
             lambda: 0.0005,
             half_pel: true,
+            good_enough: 0.0,
         };
         let f = estimate(&Plane::new(&curd, w, h), &Plane::new(&refd, w, h), &sp, None, true);
         for r in 1..f.rows - 1 {
             for c in 1..f.cols - 1 {
                 let v = f.get(c, r);
                 assert!((v.dx - 5.5).abs() < 0.01 && (v.dy + 3.0).abs() < 0.01, "{c},{r}: {v:?}");
+            }
+        }
+        // With an early exit: a zero vector far from the match still gets the
+        // full search, and the previous field's vectors are kept as they are.
+        let quick = SearchParams { good_enough: 0.02, ..sp };
+        let g = estimate(&Plane::new(&curd, w, h), &Plane::new(&refd, w, h), &quick, None, true);
+        let g2 = estimate(&Plane::new(&curd, w, h), &Plane::new(&refd, w, h), &quick, Some(&g), true);
+        for field in [&g, &g2] {
+            for r in 1..field.rows - 1 {
+                for c in 1..field.cols - 1 {
+                    let v = field.get(c, r);
+                    assert!((v.dx - 5.5).abs() < 0.01 && (v.dy + 3.0).abs() < 0.01, "{c},{r}: {v:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_sums_match_the_plain_ones() {
+        let (w, h) = (97usize, 41usize);
+        let a: Vec<f32> = (0..w * h).map(|i| ((i * 37 % 101) as f32 * 0.013).sin()).collect();
+        let b: Vec<f32> = (0..w * h).map(|i| ((i * 53 % 89) as f32 * 0.017).cos()).collect();
+        let (pa, pb) = (Plane::new(&a, w, h), Plane::new(&b, w, h));
+        let plain = |bx: usize, by: usize, dx: f32, dy: f32| {
+            let mut s = 0.0f64;
+            let mut n = 0;
+            for y in by..(by + 16).min(h) {
+                for x in bx..(bx + 16).min(w) {
+                    s += (pa.data[y * w + x] - pb.sample(x as f32 + dx, y as f32 + dy)).abs() as f64;
+                    n += 1;
+                }
+            }
+            (s / n as f64) as f32
+        };
+        // Inside the plane, at the edges (clamped path) and at fractional
+        // displacements.
+        for (bx, by) in [(20, 10), (0, 0), (90, 30), (40, 25)] {
+            for (dx, dy) in [(0.0f32, 0.0f32), (3.0, -2.0), (-5.0, 4.0), (2.5, -1.5), (-0.5, 0.5), (7.5, 3.0)] {
+                let want = plain(bx, by, dx, dy);
+                let got = if dx.fract() == 0.0 && dy.fract() == 0.0 {
+                    sad_int(&pa, &pb, bx, by, 16, 16, dx as i32, dy as i32, 1)
+                } else {
+                    sad_frac(&pa, &pb, bx, by, 16, 16, dx, dy)
+                };
+                assert!((got - want).abs() < 1e-5, "({bx},{by}) ({dx},{dy}): {got} vs {want}");
             }
         }
     }
