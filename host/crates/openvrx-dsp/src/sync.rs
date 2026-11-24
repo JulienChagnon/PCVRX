@@ -206,6 +206,9 @@ pub struct Tbc {
     scratch: Vec<f32>,
     /// Standard deviation of the last timing innovation (input samples).
     innov_sd: f64,
+    /// Offset (input samples) of the next line's own measured edge from its
+    /// flywheel start, 0 when that line is cut on the flywheel.
+    cut_off: f64,
     has_mag: bool,
     /// Squared quantiser step of the lanes in envelope units (C/N cap and floor test,
     /// `cn::quant_cap`), 0 when unknown.
@@ -367,6 +370,7 @@ impl Tbc {
             report: SyncReport::default(),
             scratch: Vec::new(),
             innov_sd: 1.0,
+            cut_off: 0.0,
             has_mag: true,
             step2: 0.0,
             last_ctx: None,
@@ -499,6 +503,7 @@ impl Tbc {
             self.low = false;
             self.pending = None;
             self.pulses.clear();
+            self.cut_off = 0.0;
             self.ever_locked = false;
             self.searching = true;
             self.field_known = false;
@@ -840,6 +845,7 @@ impl Tbc {
             self.report.relocks += 1;
         } else {
             self.t = t;
+            self.cut_off = 0.0;
             self.line_n = 0;
             self.vsync_checked_upto = 0;
             self.vsync_bad = 0;
@@ -1038,6 +1044,9 @@ impl Tbc {
         let pb = b + c;
         let pc = c + qp;
         let t_start = self.t; // start of the line being emitted
+        // Where this line's samples are cut from, relative to t_start: its own
+        // measured edge when the previous step found it precise.
+        let off_this = std::mem::take(&mut self.cut_off);
         let pred = self.t + self.p;
         let found = self.pulse_near(pred, w).filter(|p| p.kind != PulseKind::Other);
         let mut measured = None;
@@ -1045,8 +1054,11 @@ impl Tbc {
         let mut outlier = false;
         // Edge of a pulse found near the prediction but outside the gate.
         let mut outlier_at = None;
+        // Measured edge of the next line and its sigma (accepted or not).
+        let mut edge = None;
         if let Some(pu) = found {
             if let Some((m, sig)) = self.fine_edge(pu.start) {
+                edge = Some((m, sig));
                 let r = sig * sig;
                 let s = pa + r;
                 let nu = m - pred;
@@ -1079,6 +1091,24 @@ impl Tbc {
         }
         let pn = self.nominal_period(std);
         self.p = self.p.clamp(pn * 0.995, pn * 1.005);
+        // The next line is cut from its own edge if that edge is precise and
+        // near the flywheel; the flywheel (t, p) is not moved by this. A jump
+        // below resets it.
+        // Carrier present around the edge: in a dropout the tracked noise
+        // level is stale, so a noise pulse would look like a precise edge.
+        if self.cfg.follow_edge_us > 0.0 && !self.searching && self.line_strong(t_start, pred + self.us(5.0)) {
+            if let Some((m, sig)) = edge {
+                let off = m - self.t;
+                // Dead zone: an offset within edge noise (k innovation sd) is
+                // noise, and the flywheel (many edges) is the better start.
+                if sig <= self.us(self.cfg.follow_sigma_us as f64)
+                    && off.abs() <= self.us(self.cfg.follow_edge_us as f64)
+                    && off.abs() > self.cfg.follow_min_sd as f64 * self.innov_sd
+                {
+                    self.cut_off = off;
+                }
+            }
+        }
         // Half-line slot of the line being emitted.
         let s1 = self
             .pulse_near(t_start + 0.5 * self.p, w)
@@ -1127,6 +1157,7 @@ impl Tbc {
         if let Some(jt) = jump_to {
             line_end = t_start + self.p;
             self.t = jt;
+            self.cut_off = 0.0;
             self.cov = [0.05, 0.0, self.cov[2].max(1e-4)];
             self.relock_hist.clear();
             self.expect_jump = false;
@@ -1201,8 +1232,10 @@ impl Tbc {
             let rec = self.make_line(
                 std,
                 ctx,
-                t_start,
-                line_end,
+                // Rigid shift: the line keeps the flywheel's length, so its
+                // picture is not stretched toward the next line's edge.
+                t_start + off_this,
+                line_end + off_this,
                 fl,
                 slot0_this,
                 measured.is_some(),

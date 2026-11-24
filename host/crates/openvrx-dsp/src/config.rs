@@ -330,6 +330,22 @@ pub struct SyncConfig {
     /// cameras: a pulse the camera really sent there was refused and the
     /// flywheel snapped back to it with a relock a few lines later.
     pub gate_min_us: f32,
+    /// Largest offset (us) between a line's measured sync edge and the
+    /// flywheel's start for that line at which the line is cut from its own
+    /// edge (0 disables: every line is cut on the flywheel). The flywheel
+    /// state itself stays smooth; only where the line's samples are taken
+    /// moves. A source whose single lines start late or early (FPV cameras,
+    /// HDMI-to-CVBS converters) otherwise shows those lines shifted
+    /// sideways, because the small phase_noise gain barely follows them.
+    pub follow_edge_us: f32,
+    /// Largest edge timing sigma (us, noise over edge slope) at which a line
+    /// is cut from its own edge: on noisy signals one edge is less precise
+    /// than the flywheel and the line stays on it.
+    pub follow_sigma_us: f32,
+    /// Smallest offset, in standard deviations of the timing innovation, at
+    /// which a line is cut from its own edge. Below it the offset is edge
+    /// noise, and following it would add jitter on a signal that has none.
+    pub follow_min_sd: f32,
     /// Emit lines before the first vertical sync after this many fields.
     pub provisional_fields: u32,
     /// Segment length (us) for the per-segment envelope C/N grading of the
@@ -360,6 +376,9 @@ impl Default for SyncConfig {
             level_noise_ire: 0.15,
             window_us: 1.6,
             gate_min_us: 0.4,
+            follow_edge_us: 1.5,
+            follow_sigma_us: 0.03,
+            follow_min_sd: 3.0,
             provisional_fields: 2,
             segment_us: 4.0,
             segment_clean_db: 15.0,

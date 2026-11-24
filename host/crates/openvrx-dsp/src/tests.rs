@@ -400,6 +400,10 @@ fn wobble_run_pn(gate_us: f32, phase_noise: f32, cn: f64, wobble_us: f64) -> (f6
     let mut cfg = cfg_for(&spec);
     cfg.sync.gate_min_us = gate_us;
     cfg.sync.phase_noise = phase_noise;
+    // The gate alone: cutting lines from their own edges (follow_edge_us,
+    // tested by cuts_wobbling_lines_from_their_own_edge) hides the start
+    // error difference between gates.
+    cfg.sync.follow_edge_us = 0.0;
     let mut r = run(spec.clone(), cfg, secs(&spec, 0.04), 4096);
     let from = r.lines.len();
     r.gen.set_line_wobble(wobble_us, 7);
@@ -416,6 +420,72 @@ fn accepts_camera_line_timing_wobble() {
     let (rms_old, fly_old) = wobble_run(0.08, 25.0, 0.3);
     assert!(fly_new < 0.2 * fly_old, "flywheel {fly_new:.3} vs {fly_old:.3} with the narrow gate");
     assert!(rms_new < 0.9 * rms_old, "start error {rms_new:.3} us vs {rms_old:.3} us");
+}
+
+fn follow_run(follow_us: f32, cn: f64, wobble_us: f64) -> (f64, f64) {
+    follow_run_sigma(follow_us, SyncConfig::default().follow_sigma_us, cn, wobble_us)
+}
+
+fn follow_run_sigma(follow_us: f32, sigma_us: f32, cn: f64, wobble_us: f64) -> (f64, f64) {
+    let spec = SigSpec {
+        cn_db: Some(cn),
+        ..SigSpec::default()
+    };
+    let mut cfg = cfg_for(&spec);
+    cfg.sync.follow_edge_us = follow_us;
+    cfg.sync.follow_sigma_us = sigma_us;
+    let mut r = run(spec.clone(), cfg, secs(&spec, 0.04), 4096);
+    let from = r.lines.len();
+    if wobble_us > 0.0 {
+        r.gen.set_line_wobble(wobble_us, 7);
+    }
+    feed(&mut r, secs(&spec, 0.1), 4096);
+    start_error(&r, from + 30)
+}
+
+/// A camera or converter whose single lines start late or early.
+/// The flywheel stays smooth, but each line is cut from its own precise
+/// edge, so its picture is not shifted sideways by the wobble.
+#[test]
+fn cuts_wobbling_lines_from_their_own_edge() {
+    let (on, _) = follow_run(SyncConfig::default().follow_edge_us, 25.0, 0.3);
+    let (off, _) = follow_run(0.0, 25.0, 0.3);
+    assert!(on < 0.3 * off, "start error {on:.3} us with follow vs {off:.3} us without");
+}
+
+/// On a noisy signal without wobble one edge is less precise than the
+/// flywheel: following may add only a little jitter (0.015 us is about 0.2
+/// px; the wobble it removes is ten times that, see diag_follow), and
+/// nearly none on a clean signal (the dead zone).
+#[test]
+fn follow_edge_adds_little_jitter_without_wobble() {
+    for (cn, extra) in [(10.0, 0.015), (18.0, 0.005), (30.0, 0.001)] {
+        let (on, _) = follow_run(SyncConfig::default().follow_edge_us, cn, 0.0);
+        let (off, _) = follow_run(0.0, cn, 0.0);
+        assert!(on <= off + extra, "C/N {cn}: start error {on:.4} us with follow vs {off:.4} us without");
+    }
+}
+
+/// Follow sweep: `cargo test -p openvrx-dsp --release -- --ignored diag_follow --nocapture`;
+/// FS=0.03,0.015 sets the follow_sigma_us values (default: the config's).
+#[test]
+#[ignore]
+fn diag_follow() {
+    let sigmas: Vec<f32> = std::env::var("FS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![SyncConfig::default().follow_sigma_us]);
+    for &fs in &sigmas {
+        for cn in [10.0, 14.0, 18.0, 25.0, 35.0] {
+            for wob in [0.0, 0.15, 0.3, 0.5] {
+                let (on, fly) = follow_run_sigma(SyncConfig::default().follow_edge_us, fs, cn, wob);
+                let (off, _) = follow_run(0.0, cn, wob);
+                println!(
+                    "sigma {fs:.3} cn {cn:4.1} wobble {wob:.2} us: start error rms {off:.4} -> {on:.4} us (flywheel {fly:.3})"
+                );
+            }
+        }
+    }
 }
 
 /// Gate floor against wobble and C/N: `cargo test -p openvrx-dsp --release -- --ignored diag_gate --nocapture`.
