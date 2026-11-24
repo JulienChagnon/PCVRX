@@ -11,6 +11,7 @@ pub enum Action {
     Osd,
     Record,
     RecordVideo,
+    Library,
     Preset,
     PresetPrev,
     SteadyOsd,
@@ -38,6 +39,7 @@ pub const BINDINGS: &[(Key, bool, Action, &str)] = &[
     (Key::O, false, Action::Osd, "OSD on/off (C/N bars stay in every picture mode but raw)"),
     (Key::R, false, Action::Record, "Start or stop raw recording"),
     (Key::M, false, Action::RecordVideo, "Start or stop video recording (decoded picture of view 1, MP4; needs ffmpeg)"),
+    (Key::B, false, Action::Library, "Recordings: browse the recording folder, play videos, run tools on a recording"),
     (Key::ArrowRight, false, Action::Preset, "Next picture mode: raw / low latency / balanced / quality / learned / plugin"),
     (Key::ArrowLeft, false, Action::PresetPrev, "Previous picture mode"),
     (Key::I, false, Action::SteadyOsd, "Steady OSD: fields line-doubled like goggles (off: true interlace rows)"),
@@ -53,7 +55,7 @@ pub const BINDINGS: &[(Key, bool, Action, &str)] = &[
     (Key::OpenBracket, false, Action::ChannelDown, "Channel down (all receivers)"),
     (Key::CloseBracket, false, Action::ChannelUp, "Channel up (all receivers)"),
     (Key::F5, false, Action::ResetStats, "Reset latency statistics"),
-    (Key::Escape, false, Action::Escape, "Menu: every action with its key, band and channel (closes help and panels first)"),
+    (Key::Escape, false, Action::Escape, "Menu: channel, picture mode and every action with its key (closes help, panels and recordings first)"),
     (Key::Q, true, Action::Quit, "Quit"),
 ];
 

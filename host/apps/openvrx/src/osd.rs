@@ -9,6 +9,7 @@ use crate::commands::{BackendStatus, RecordingStatus, VideoRecordingStatus};
 use crate::gpu::{palette_index, PALETTE};
 use crate::source::{LockState, SourceStatus};
 use crate::stats::Summary;
+use crate::theme;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
 /// C/N at which a bar is full.
@@ -113,21 +114,52 @@ fn palette_color(rx: u8) -> Color32 {
     Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
 }
 
-fn lock_color(l: LockState) -> Color32 {
+pub fn lock_color(l: LockState) -> Color32 {
     match l {
-        LockState::Locked => Color32::from_rgb(60, 220, 90),
-        LockState::Flywheel => Color32::from_rgb(240, 200, 40),
-        _ => Color32::from_rgb(235, 50, 50),
+        LockState::Locked => theme::GOOD,
+        LockState::Flywheel => theme::WARN,
+        _ => theme::BAD,
     }
 }
 
 /// Text with a dark backing so it reads on any picture.
 fn label(p: &Painter, pos: Pos2, anchor: Align2, text: &str, size: f32, color: Color32) -> Rect {
-    let galley = p.layout_no_wrap(text.to_string(), FontId::monospace(size), color);
-    let rect = anchor.anchor_size(pos, galley.size()).expand(2.0);
-    p.rect_filled(rect, 2.0, Color32::from_black_alpha(150));
-    p.galley(rect.min + Vec2::splat(2.0), galley, color);
-    rect
+    theme::plate(p, pos, anchor, text, FontId::monospace(size), color)
+}
+
+/// OSD scale and margin: goggle-safe layout keeps clear of the lens edges.
+fn scale_margin(rect: Rect, goggle: bool) -> (f32, f32) {
+    if goggle {
+        (1.5, rect.width() * 0.06)
+    } else {
+        (1.0, 8.0)
+    }
+}
+
+/// Where the picture mode badge goes in `area` (top left), without drawing it.
+/// Computed before the views so their labels can step below it.
+pub fn mode_badge_rect(p: &Painter, area: Rect, goggle: bool, text: &str) -> Rect {
+    let (scale, margin) = scale_margin(area, goggle);
+    let galley = p.layout_no_wrap(text.to_string(), FontId::monospace(13.0 * scale), Color32::WHITE);
+    let size = galley.size() + Vec2::new(18.0 * scale, 8.0 * scale);
+    Rect::from_min_size(area.shrink(margin).left_top(), size)
+}
+
+/// The picture mode badge: always on with the OSD, so the mode on screen is
+/// never a guess. A bar in the mode's colour, then its name.
+pub fn paint_mode_badge(p: &Painter, rect: Rect, text: &str, color: Color32) {
+    p.rect_filled(rect, 2.0, theme::SCRIM);
+    let bar = Rect::from_min_size(rect.min, Vec2::new(3.0 * (rect.height() / 25.0).max(1.0), rect.height()));
+    p.rect_filled(bar, 0.0, color);
+    let size = rect.height() - 8.0 * (rect.height() / 25.0).max(1.0);
+    let font = FontId::monospace(size.max(9.0));
+    p.text(
+        Pos2::new(bar.right() + (rect.width() - bar.width()) / 2.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        text,
+        font,
+        color,
+    );
 }
 
 /// What to draw for one view.
@@ -138,18 +170,19 @@ pub struct ViewOsd<'a> {
     pub goggle: bool,
     pub cleanup: bool,
     pub error: Option<&'a str>,
+    /// Space taken by the mode badge: the view's top line goes below it.
+    pub avoid: Option<Rect>,
 }
 
 /// Paints a view's OSD inside `rect` (the picture area).
 pub fn paint_view(p: &Painter, rect: Rect, o: &ViewOsd<'_>) {
-    let scale = if o.goggle { 1.5 } else { 1.0 };
-    let margin = if o.goggle { rect.width() * 0.06 } else { 8.0 };
+    let (scale, margin) = scale_margin(rect, o.goggle);
     let inner = rect.shrink(margin);
     let text = 13.0 * scale;
     let s = o.status;
 
     if let Some(err) = o.error {
-        label(p, rect.center(), Align2::CENTER_CENTER, err, text, Color32::from_rgb(255, 120, 120));
+        label(p, rect.center(), Align2::CENTER_CENTER, err, text, theme::BAD);
     }
     // C/N bars: always while cleanup is active (safety rule).
     if o.full || o.cleanup {
@@ -181,10 +214,19 @@ pub fn paint_view(p: &Painter, rect: Rect, o: &ViewOsd<'_>) {
     // Top left: channel, standard, lock.
     let std = s.standard.map_or("--", |v| v.name());
     let head = format!("{}  {}", s.label, std);
-    let r = label(p, inner.left_top(), Align2::LEFT_TOP, &head, text, Color32::WHITE);
+    let mut top_left = inner.left_top();
+    if let Some(b) = o.avoid {
+        // The badge sits at the window's top left: step down if this view's
+        // top line would run into it.
+        let line = Rect::from_min_size(top_left, Vec2::new(inner.width(), text + 8.0));
+        if line.intersects(b) {
+            top_left.y = b.bottom() + 4.0;
+        }
+    }
+    let r = label(p, top_left, Align2::LEFT_TOP, &head, text, Color32::WHITE);
     label(
         p,
-        Pos2::new(r.right() + 6.0, r.top() + 2.0),
+        Pos2::new(r.right() + 4.0, r.top()),
         Align2::LEFT_TOP,
         s.lock.name(),
         text,
@@ -246,62 +288,41 @@ pub fn paint_view(p: &Painter, rect: Rect, o: &ViewOsd<'_>) {
     }
 }
 
-/// Paints the window-wide indicators (REC, cleanup state, backend,
-/// warnings, recent messages).
-pub fn paint_global(
-    p: &Painter,
-    rect: Rect,
-    backend: &BackendStatus,
-    cleanup: bool,
-    messages: &[String],
-    now_ns: u64,
-    goggle: bool,
-) {
-    let scale = if goggle { 1.5 } else { 1.0 };
-    let margin = if goggle { rect.width() * 0.06 } else { 8.0 };
+/// Paints the window-wide indicators at the top right (REC, VID, TEST) and
+/// the backend's warnings and recent messages under them. The picture mode
+/// badge (top left) is drawn separately, see [`paint_mode_badge`].
+pub fn paint_global(p: &Painter, rect: Rect, backend: &BackendStatus, messages: &[String], now_ns: u64, goggle: bool) {
+    let (scale, margin) = scale_margin(rect, goggle);
     let inner = rect.shrink(margin);
     let text = 14.0 * scale;
     let mut x = inner.right();
-    if let Some(rec) = fmt_rec(&backend.recording, now_ns) {
-        let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, &rec, text, Color32::WHITE);
-        p.circle_filled(Pos2::new(r.left() - 10.0, r.center().y), 6.0 * scale, Color32::RED);
-        x = r.left() - 22.0;
+    let mut bottom = inner.top();
+    for t in [fmt_rec(&backend.recording, now_ns), fmt_video_rec(&backend.recording.video, now_ns)].into_iter().flatten() {
+        let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, &t, text, Color32::WHITE);
+        p.circle_filled(Pos2::new(r.left() - 9.0, r.center().y), 5.0 * scale, theme::BAD);
+        x = r.left() - 22.0 * scale;
+        bottom = r.bottom();
     }
-    if let Some(vid) = fmt_video_rec(&backend.recording.video, now_ns) {
-        let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, &vid, text, Color32::WHITE);
-        p.circle_filled(Pos2::new(r.left() - 10.0, r.center().y), 6.0 * scale, Color32::RED);
-        x = r.left() - 22.0;
-    }
-    let (state, color) = if cleanup {
-        ("CLEAN", Color32::from_rgb(120, 200, 255))
-    } else {
-        ("RAW", Color32::from_rgb(255, 210, 80))
-    };
-    let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, state, text, color);
     if !backend.live && !backend.name.is_empty() {
-        label(
-            p,
-            Pos2::new(r.left() - 8.0, inner.top()),
-            Align2::RIGHT_TOP,
-            "TEST",
-            text,
-            Color32::from_rgb(255, 150, 255),
-        );
+        let r = label(p, Pos2::new(x, inner.top()), Align2::RIGHT_TOP, "TEST", text, Color32::from_rgb(236, 150, 255));
+        bottom = r.bottom();
     }
     if goggle {
         return;
     }
-    let mut y = inner.top() + text + 12.0;
+    // Toasts: a bar in the level's colour, the text in white.
+    let mut y = bottom.max(inner.top() + text) + 8.0;
     for w in backend.warnings.iter().chain(messages.iter()) {
-        let r = label(
-            p,
-            Pos2::new(inner.right(), y),
-            Align2::RIGHT_TOP,
-            w,
-            text * 0.8,
-            Color32::from_rgb(255, 200, 160),
-        );
-        y = r.bottom() + 2.0;
+        let color = if w.starts_with("error") {
+            theme::BAD
+        } else if w.starts_with("warning") || backend.warnings.contains(w) {
+            theme::WARN
+        } else {
+            theme::ACCENT
+        };
+        let r = label(p, Pos2::new(inner.right(), y), Align2::RIGHT_TOP, w, text * 0.82, Color32::WHITE);
+        p.rect_filled(Rect::from_min_size(r.left_top() - Vec2::new(3.0, 0.0), Vec2::new(3.0, r.height())), 0.0, color);
+        y = r.bottom() + 3.0;
     }
 }
 

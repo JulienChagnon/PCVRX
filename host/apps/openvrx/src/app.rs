@@ -32,6 +32,14 @@ const LATENCY_WINDOW: usize = 2048;
 /// How long a message stays on screen.
 const MESSAGE_NS: u64 = 8_000_000_000;
 
+/// What the headers of the menu and the recordings page show of the live view.
+struct LiveSummary {
+    lock: (&'static str, egui::Color32),
+    cn_db: Option<f32>,
+    recording: Vec<String>,
+    channel: String,
+}
+
 struct ViewRt {
     source: Option<Box<dyn FrameSource>>,
     staging: UploadStaging,
@@ -77,6 +85,8 @@ pub struct OpenvrxApp {
     show_help: bool,
     /// The Esc menu (actions with their keys, band and channel).
     menu: Menu,
+    /// The recordings page (key B): player and external tools.
+    library: crate::library::Library,
     /// The strip shown when the preset changes (arrow keys, menu).
     preset_switch: crate::preset_switch::PresetSwitch,
     surface_applied: Option<(wgpu::PresentMode, u32)>,
@@ -112,6 +122,7 @@ impl OpenvrxApp {
             .wgpu_render_state
             .as_ref()
             .ok_or("the wgpu renderer is required")?;
+        crate::theme::apply(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let waker: Waker = Arc::new(move || ctx.request_repaint());
         let backend = backend_start(Arc::clone(&waker)).map_err(|e| format!("backend: {e}"))?;
@@ -127,6 +138,7 @@ impl OpenvrxApp {
         for cmd in full_state(&settings, views) {
             backend.send(cmd);
         }
+        let tools_dir = crate::tools::tools_dir(store.path());
         let mut messages = VecDeque::new();
         if let Some(n) = startup_note {
             messages.push_back((now_ns(), n));
@@ -148,6 +160,7 @@ impl OpenvrxApp {
             show_panels: false,
             show_help: false,
             menu: Menu::new(),
+            library: crate::library::Library::new(tools_dir),
             preset_switch: Default::default(),
             surface_applied: None,
             supported_modes,
@@ -441,6 +454,11 @@ impl OpenvrxApp {
                 .collect()
         });
         for (key, ctrl) in pressed {
+            // The recordings page takes its transport keys (Space, arrows...)
+            // before the global bindings; the menu takes Up/Down/Enter itself.
+            if !ctrl && self.library.handle_key(key) {
+                continue;
+            }
             if let Some(a) = action_for(key, ctrl) {
                 self.act(ctx, a);
             }
@@ -505,13 +523,19 @@ impl OpenvrxApp {
                     v.latency.clear();
                 }
             }
+            Action::Library => {
+                self.menu.open = false;
+                self.library.toggle(&self.settings.recording.folder);
+            }
             Action::Escape => {
                 if self.show_help || self.show_panels {
                     self.show_help = false;
                     self.show_panels = false;
+                } else if self.library.open && !self.menu.open {
+                    self.library.close();
                 } else {
                     let mhz = self.current_mhz();
-                    self.menu.toggle(mhz);
+                    self.menu.toggle(mhz, ctx.cumulative_frame_nr());
                 }
             }
             Action::Compare => self.toggle_compare(),
@@ -558,6 +582,7 @@ impl OpenvrxApp {
         let v = self.settings.video.clone();
         let recording = self.backend_status.recording.active;
         let video_recording = self.backend_status.recording.video.active;
+        let jobs = self.library.jobs.running();
         let state = move |a: Action| match a {
             Action::Fullscreen => RowState::On(d.fullscreen),
             Action::Osd => RowState::On(d.osd),
@@ -567,6 +592,7 @@ impl OpenvrxApp {
             Action::SteadyOsd => RowState::On(v.steady_osd),
             Action::Record => RowState::On(recording),
             Action::RecordVideo => RowState::On(video_recording),
+            Action::Library if jobs > 0 => RowState::Value(format!("{jobs} running")),
             Action::Layout => RowState::Value(d.layout.name().to_string()),
             Action::Aspect => RowState::Value(d.aspect.name().to_string()),
             Action::Scaling => RowState::Value(d.scaling.name().to_string()),
@@ -574,14 +600,52 @@ impl OpenvrxApp {
             Action::PresentTrigger => RowState::Value(d.present_trigger.name().to_string()),
             _ => RowState::None,
         };
-        let mhz = self.current_mhz();
         let preset = self.settings.video.preset;
-        for pick in self.menu.show(ctx, mhz, preset, state) {
+        let st = self.live_summary();
+        let status = crate::menu::MenuStatus {
+            mhz: self.current_mhz(),
+            preset,
+            preset_note: self.preset_note(),
+            lock: st.lock,
+            cn_db: st.cn_db,
+            recording: st.recording,
+        };
+        for pick in self.menu.show(ctx, &status, state) {
             match pick {
                 MenuPick::Act(a) => self.act(ctx, a),
                 MenuPick::Tune(f) => self.tune(f),
                 MenuPick::Preset(p) => self.set_preset(p, p.index() as i32 - preset.index() as i32),
             }
+        }
+    }
+
+    /// View 1's lock and best C/N, and the recording tags, for the menu and
+    /// the recordings page headers.
+    fn live_summary(&self) -> LiveSummary {
+        let s = &self.views[0].status;
+        let has_source = self.views[0].source.is_some();
+        let lock = if has_source { s.lock } else { crate::source::LockState::NoSignal };
+        let cn_db = s.receivers.iter().map(|r| r.cn_db).filter(|c| c.is_finite()).reduce(f32::max);
+        let now = now_ns();
+        let rec = &self.backend_status.recording;
+        let recording = [crate::osd::fmt_rec(rec, now), crate::osd::fmt_video_rec(&rec.video, now)]
+            .into_iter()
+            .flatten()
+            .collect();
+        LiveSummary {
+            lock: (lock.name(), crate::osd::lock_color(lock)),
+            cn_db,
+            recording,
+            channel: if s.label.is_empty() { channels::label(self.current_mhz()) } else { s.label.clone() },
+        }
+    }
+
+    /// Opens the recordings page (closes the menu and the panels).
+    pub fn open_library(&mut self) {
+        self.menu.open = false;
+        self.show_panels = false;
+        if !self.library.open {
+            self.library.toggle(&self.settings.recording.folder);
         }
     }
 
@@ -672,6 +736,16 @@ impl OpenvrxApp {
         painter.rect_filled(area, 0.0, egui::Color32::BLACK);
         let goggle = eff.osd_layout == crate::settings::OsdLayout::GoggleSafe;
         let cleanup = self.settings.video.cleanup_active();
+        // Picture mode badge, top left of the window (laid out first so the
+        // views' top lines can step below it; painted after the pictures).
+        let preset = self.settings.video.preset;
+        let badge_text = preset.title().to_uppercase();
+        let badge_color = if self.preset_note().is_some() {
+            crate::theme::WARN
+        } else {
+            crate::theme::mode_color(preset == crate::settings::VideoPreset::Raw)
+        };
+        let badge = d.osd.then(|| crate::osd::mode_badge_rect(&painter, area, goggle, &badge_text));
         for (k, cell) in cells.iter().enumerate().take(n) {
             let geom = fit_picture(*cell, 4.0 / 3.0, par, eff.aspect, d.overscan_percent);
             let dest = egui::Rect::from_min_size(
@@ -699,8 +773,12 @@ impl OpenvrxApp {
                     goggle,
                     cleanup,
                     error,
+                    avoid: badge,
                 },
             );
+        }
+        if let Some(b) = badge {
+            crate::osd::paint_mode_badge(&painter, b, &badge_text, badge_color);
         }
         if d.osd {
             let now = now_ns();
@@ -712,38 +790,48 @@ impl OpenvrxApp {
                 self.messages.pop_front();
             }
             let msgs: Vec<String> = self.messages.iter().map(|m| m.1.clone()).collect();
-            paint_global(
-                &painter,
-                area,
-                &self.backend_status,
-                self.settings.video.cleanup_active(),
-                &msgs,
-                now,
-                goggle,
-            );
+            paint_global(&painter, area, &self.backend_status, &msgs, now, goggle);
         }
     }
 
+    /// F1: every key in one table (key cap, what it does), and where the
+    /// settings and tools live.
     fn help_window(&mut self, ctx: &egui::Context) {
+        use crate::theme::{DIM, FAINT, TEXT};
         let mut open = self.show_help;
-        egui::Window::new("OpenVRX keys")
+        egui::Window::new(egui::RichText::new("Keys").color(TEXT))
             .open(&mut open)
             .collapsible(false)
+            .resizable(false)
+            .fade_in(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::Grid::new("keys").striped(true).show(ui, |ui| {
-                    for (key, ctrl, _, text) in BINDINGS {
-                        ui.monospace(key_name(*key, *ctrl));
-                        ui.label(*text);
-                        ui.end_row();
-                    }
-                });
-                ui.separator();
-                ui.label(format!(
-                    "Settings: {}   GPU: {}",
-                    self.store.path().display(),
-                    self.adapter_name
-                ));
+                ui.set_width(620.0);
+                egui::ScrollArea::vertical()
+                    .max_height(ctx.content_rect().height() - 180.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("keys").num_columns(2).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+                            for (key, ctrl, _, text) in BINDINGS {
+                                ui.label(
+                                    egui::RichText::new(key_name(*key, *ctrl)).font(crate::theme::mono(12.5)).color(TEXT),
+                                );
+                                ui.label(egui::RichText::new(*text).color(DIM));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("Settings  {}", self.store.path().display()))
+                        .size(crate::theme::SIZE_SMALL)
+                        .color(FAINT),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Tools  {}", crate::tools::tools_dir(self.store.path()).display()))
+                        .size(crate::theme::SIZE_SMALL)
+                        .color(FAINT),
+                );
+                ui.label(egui::RichText::new(format!("GPU  {}", self.adapter_name)).size(crate::theme::SIZE_SMALL).color(FAINT));
             });
         self.show_help = open;
     }
@@ -789,22 +877,42 @@ impl eframe::App for OpenvrxApp {
             ctx.request_repaint_after(Duration::from_nanos(deadline.saturating_sub(now)));
         }
         self.handle_keys(&ctx);
+        for n in self.library.poll() {
+            self.note(n);
+        }
 
         if self.show_panels {
             egui::Panel::right("panels")
                 .resizable(true)
-                .default_size(340.0)
+                .default_size(360.0)
+                .frame(egui::Frame::NONE.fill(crate::theme::SURFACE).inner_margin(egui::Margin::symmetric(14, 12)))
                 .show(ui, |ui| panels::show(ui, self));
         }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-            .show(ui, |ui| self.draw_video(ui));
+        if self.library.open {
+            // The live view keeps running (sources polled and uploaded above,
+            // recordings go on); only its drawing gives way to the page.
+            let st = self.live_summary();
+            let preset = self.settings.video.preset;
+            let live = crate::library::LiveLine {
+                channel: st.channel,
+                lock: st.lock,
+                recording: st.recording,
+                mode: (preset.title(), crate::theme::mode_color(preset == crate::settings::VideoPreset::Raw)),
+            };
+            self.library.show(ui, &live);
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                .show(ui, |ui| self.draw_video(ui));
+        }
         if self.show_help {
             self.help_window(&ctx);
         }
         self.menu_ui(&ctx);
-        let (preset, note) = (self.settings.video.preset, self.preset_note());
-        self.preset_switch.draw(&ctx, preset, note, now_ns());
+        if !self.library.open {
+            let (preset, note) = (self.settings.video.preset, self.preset_note());
+            self.preset_switch.draw(&ctx, preset, note, now_ns());
+        }
         self.apply_settings(&ctx, frame);
 
         // Line-to-submit latency: the frame built here is submitted and

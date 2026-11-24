@@ -35,11 +35,13 @@ its own power with the settings it saved, so tell the app what those are:
 | Key | Action |
 |---|---|
 | F1 | help |
-| Tab | open/close the side panels (the menu: receivers, video, display, recording) |
+| Esc | the menu: channel, picture mode, every action with its key (closes help, panels and the recordings page first) |
+| Tab | open/close the settings panel (receivers, video, recording, display) |
 | O | OSD on/off |
 | Left / Right | previous / next picture mode |
 | R | start/stop recording |
 | M | start/stop video recording (MP4 of view 1, needs ffmpeg) |
+| B | the recordings page: play videos, run tools on a recording |
 | H | HD3 mode |
 | V | 1, 2 or 4 views |
 | A | aspect (fit, fill, stretch) |
@@ -51,11 +53,67 @@ its own power with the settings it saved, so tell the app what those are:
 | [ and ] | channel down/up (needs `--control c5`) |
 | F5 | reset latency statistics |
 | F11 | fullscreen |
-| Esc | close help/panels, leave fullscreen |
 | Ctrl+Q | quit |
 
-The side panels (Tab) are the menu. In FX2-only mode the channel and gain
-controls there do nothing; change them on the C5 (below).
+The menu (Esc) opens at once on the left side of the window. Up/Down move
+through its rows and Enter runs one, so it works without a mouse; a click
+outside it closes it, and the other keys keep working while it is open. In
+FX2-only mode a channel picked there is set on the C5 over its console when
+the C5's USB is plugged in; the settings panel's channel and gain controls do
+nothing in that mode (change them on the C5, below).
+
+The OSD shows the picture mode at the top left at all times (amber for raw,
+teal for the cleaned modes, amber with a warning when plugin mode has no
+plugin loaded). A mode change also shows a strip near the bottom of the
+window with the mode's description for under two seconds.
+
+The UI font is the system's regular sans (Adwaita Sans, Inter, Noto Sans,
+DejaVu Sans or Liberation Sans on Linux, Segoe UI on Windows) when one is
+found; `OPENVRX_UI_FONT=FILE` picks another file, `OPENVRX_UI_FONT=builtin`
+keeps egui's own.
+
+### Recordings page (B)
+
+The recording folder as a list, newest first: each raw recording with its
+size, length and channel, and every video whose name starts with the
+recording's name (the app's `NAME.mp4`, a tool's `NAME-clean.mp4`). Videos
+with no raw recording are listed on their own. The folder is read one level
+deep on a background thread; the refresh button reads it again.
+
+Selecting an entry plays its first video in the window (ffmpeg and ffprobe
+must be on the PATH). Keys while the page is open: Space play/pause,
+Left/Right 5 s back/forward, `,` and `.` one frame back/forward, Home to the
+start, Up/Down previous/next recording, Enter play, Esc or B back to the live
+picture. The live picture keeps running behind the page and a recording in
+progress goes on. Nothing on the page deletes or moves a file.
+
+Tools are other programs the page can run on the selected recording: each
+one is described in a JSON file in `tools.d` next to the settings file
+(`$HOME/.config/openvrx/tools.d/` on Linux, `%APPDATA%\OpenVRX\tools.d\` on
+Windows; F1 shows the path):
+
+```json
+{ "tools": [ {
+    "name": "Render video",
+    "description": "One line shown on hover",
+    "program": "~/bin/my-renderer",
+    "args": ["{input}", "{output}", "--crf", "18"],
+    "input": "raw",
+    "output_suffix": "-render.mp4"
+} ] }
+```
+
+`input` is `raw` (`{input}` is the recording's `NAME.openvrx.json`) or `video`
+(the video in the player). `{output}` is the input's name without extension
+plus `output_suffix`, in the same folder; when that file exists `-2`, `-3`...
+is added, so a tool never overwrites a file. `{base}` (the input without
+extension) and `{dir}` are also filled in. `program` may start with `~/`, and
+a relative path with a slash is taken from the JSON file's real folder
+(symlinks followed). Tools run at low priority (`nice -n 10`, below normal on
+Windows; `"low_priority": false` turns it off). Their output shows in the
+jobs strip at the bottom of the page, with a progress bar when the tool
+prints a percentage; Stop ends one, a finished one's Play opens its output.
+Closing the app stops running tools.
 
 Picture modes (the arrow keys, Esc menu or Tab, video): `raw` (demodulation,
 sync and bob only), `low_latency` (the default: comb filter, repair,
